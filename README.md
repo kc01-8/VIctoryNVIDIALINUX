@@ -60,7 +60,9 @@ What each part does today and what it still needs:
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+`rust-toolchain.toml`). On Linux, see
+[docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
+natively today, cross-building `victory.exe` and running it under Proton.
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this
