@@ -8,6 +8,9 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
+The Windows executable can also be launched under Proton on x86-64 Linux. See
+[Running with the Proton launcher](docs/proton-launcher.md).
+
 ## Status (2026-11-25)
 
 **Not playable yet, because of the framerate: about 1 frame per second in the
