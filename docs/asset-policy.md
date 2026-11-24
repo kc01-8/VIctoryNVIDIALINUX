@@ -59,6 +59,8 @@ Under Wine/Proton, vkd3d-proton and DXVK write shader caches
 derived data and `.gitignore` covers them; to keep them out of the checkout
 entirely, run from elsewhere or point `VKD3D_SHADER_CACHE_PATH` /
 `DXVK_STATE_CACHE_PATH` at a directory outside the repository.
+`scripts/victory-proton.sh` sets both paths to directories under the XDG
+cache home by default.
 
 ## Enforcement
 
