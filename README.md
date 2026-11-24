@@ -815,6 +815,9 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
 > moment). To look further, use a diagnostics build with
 > `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
 
+For an Arch Linux cross-build and a Proton Experimental run on an RTX 4080,
+see the [Linux rendering report](docs/arch-proton-rendering.md).
+
 What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
