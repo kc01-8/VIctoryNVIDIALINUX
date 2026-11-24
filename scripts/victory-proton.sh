@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start the Windows build with UMU and its Steam Linux Runtime.
-set -eu
+set -euo pipefail
 
 usage() {
     echo 'Usage: victory-proton.sh TITLE.exe [--execute] [other victory run options]'
@@ -47,7 +47,19 @@ shift
 # Hand Proton Windows paths on its standard Z: drive. A Windows executable
 # path also lets UMU-Proton attach this CLI to the calling terminal.
 export GAMEID=${GAMEID:-umu-victory}
-export WINEPREFIX=${WINEPREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton}
+data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+[[ $data_home == /* ]] || data_home=$HOME/.local/share
+[[ $cache_home == /* ]] || cache_home=$HOME/.cache
+export WINEPREFIX=${WINEPREFIX:-$data_home/victory/proton}
+# Both translation layers otherwise write derived data to the working directory.
+export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$cache_home/victory/vkd3d}
+export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$cache_home/victory/dxvk}
+# VKD3D reserves 0 for disabling its cache.
+if [[ $VKD3D_SHADER_CACHE_PATH != 0 ]]; then
+    mkdir -p -- "$VKD3D_SHADER_CACHE_PATH"
+fi
+mkdir -p -- "$DXVK_STATE_CACHE_PATH"
 windows_title=${title//\//\\}
 windows_binary=${binary//\//\\}
 export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$(dirname -- "$binary")}
