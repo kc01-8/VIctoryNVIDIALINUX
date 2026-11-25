@@ -2001,12 +2001,17 @@ fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
 /// host GPU: op_sel picks each multiplicand's low half, op_sel_hi its high
 /// half (a constant folded in as `sel_hi_lo(2.0)` is 0x4000), and
 /// `v_dot4c` accumulates into its destination.
+///
+/// The operands are made at run time, each a literal plus a word of the
+/// (zeroed) UAV: the RDNA1 driver zero-extends the bytes of a multiplicand
+/// it sees as a constant, though the DXIL asks for signed bytes (#1782).
 #[test]
 fn fspx_programs_run_with_the_hardwares_dot_products() {
     let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
-    let mut load = Vec::new();
-    for (v, x) in [(1, a), (2, b), (3, acc)] {
-        load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
+    // buffer_load_dword v4, off, s[8:11], 0: the result's word, still 0.
+    let mut load = vec![0x38 << 26 | 0x0C << 18, 0x80 << 24 | 2 << 16 | 4 << 8];
+    for (v, x) in [(1u32, a), (2, b), (3, acc)] {
+        load.extend([0x25 << 25 | v << 17 | 4 << 9 | 0xFF, x]); // v_add_nc_u32 vN, literal, v4
     }
     let cases: [(Vec<u32>, u32); 4] = [
         (
