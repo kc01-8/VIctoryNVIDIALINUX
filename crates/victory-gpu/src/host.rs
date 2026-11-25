@@ -2999,8 +2999,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    report_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -3013,8 +3012,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            report_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -3029,10 +3027,7 @@ impl Meter {
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.report_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -3054,14 +3049,12 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
-        let root_views = crate::draw::take_root_view_slots() as f64 / frames;
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let report_frames = std::mem::take(&mut self.report_frames) as f64;
+            let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            let indirect = crate::list::take_indirect() as f64 / report_frames;
+            let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -3081,8 +3074,8 @@ impl Meter {
                 saved as f64 / 1e6,
                 heap_used as f64 / 1e6,
                 heap_free as f64 / 1e6,
-                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
-                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
+                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
+                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -3106,24 +3099,25 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                // Window caption updates leave the report counters intact.
+                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
-                log_gpu_times(copy_frames);
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
+                log_gpu_times(report_frames);
+                crate::copystat::log(report_frames);
+                crate::bindless::log(report_frames);
+                crate::shadow::log_views(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
                         "texture read backs: {:.1}/frame, {:.1} KB/frame",
-                        n as f64 / frames,
-                        bytes as f64 / frames / 1e3
+                        n as f64 / report_frames,
+                        bytes as f64 / report_frames / 1e3
                     );
                 }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        *n as f64 / report_frames
                     );
                 }
             }
