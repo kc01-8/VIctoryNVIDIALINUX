@@ -614,10 +614,16 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    if matches!(format, 42 | 43) {
+        let words = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| u32_at(px(x, y, 4), 0));
+        return Some(r32_integer_to_rgba(format, words));
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -666,7 +672,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -678,7 +684,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=41 | 44..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, max) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
@@ -712,6 +718,46 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8> {
+    let signed = format == 43;
+    let mut values: Vec<i64> = words
+        .map(|word| if signed { i64::from(word as i32) } else { i64::from(word) })
+        .collect();
+    let first = values.first().copied().unwrap_or(0);
+    let (low, high) = values.iter().copied().fold((first, first), |(low, high), value| {
+        (low.min(value), high.max(value))
+    });
+    // The full 32-bit span scaled by 255 fits in i64, without float rounding.
+    let range = (high - low).max(1);
+    let flat_nonzero = high == low && low != 0;
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &value in &values {
+        let grey = if flat_nonzero {
+            255
+        } else {
+            ((value - low) * 255 / range) as u8
+        };
+        out.extend([grey, grey, grey, 255]);
+    }
+
+    let total = values.len();
+    values.retain(|&value| value != 0);
+    let nonzero = values.len() as f64 / total.max(1) as f64;
+    for value in &mut values {
+        *value = value.abs();
+    }
+    let mut at = |q: f64| -> i64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let k = ((values.len() - 1) as f64 * q).round() as usize;
+        *values.select_nth_unstable(k).1
+    };
+    let (p50, p99) = (at(0.5), at(0.99));
+    tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
+    out
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -868,5 +914,55 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod r32_tests {
+    #[test]
+    fn r32_integer_captures_scale_numeric_values() {
+        let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
+        let signed = [-2i32, -1, 0].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 3, 1, 12, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 3, 1, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_keep_adjacent_contrast() {
+        let unsigned = [16_777_216u32, 16_777_217].map(u32::to_le_bytes).concat();
+        let signed = [-16_777_217i32, -16_777_216].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_handle_full_range_and_row_pitch() {
+        let signed = [i32::MIN, -1, i32::MIN, 0, i32::MAX].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(43, 2, 2, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_uint_is_white() {
+        let rows = [7u32; 2].map(u32::to_le_bytes).concat();
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &rows), Some(vec![255; 8]));
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_sint_is_white() {
+        let rows = [-7i32; 2].map(i32::to_le_bytes).concat();
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &rows), Some(vec![255; 8]));
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_zero_is_black() {
+        let expected = Some([0, 0, 0, 255].repeat(2));
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
     }
 }
