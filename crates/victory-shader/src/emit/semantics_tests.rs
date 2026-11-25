@@ -1606,6 +1606,59 @@ fn conversion_probes() -> Vec<Probe> {
     p.push(probe([vop1(0x0B, 5, v(1))], unary(&halves), F32, |i| {
         vec![from_f16(i[0] & 0xFFFF).to_bits()]
     }));
+    // VOP3 source modifiers apply to the selected low f16, before widening.
+    for m in [
+        NONE,
+        M { neg: 1, ..NONE },
+        M { abs: 1, ..NONE },
+        M {
+            abs: 1,
+            neg: 1,
+            ..NONE
+        },
+        M {
+            neg: 1,
+            clamp: true,
+            ..NONE
+        },
+    ] {
+        p.push(probe(
+            vop3(0x18B, 5, [v(1), 0, 0], m),
+            unary(&halves),
+            F32,
+            move |i| {
+                let mut h = i[0] & 0xFFFF;
+                if m.abs & 1 != 0 {
+                    h &= 0x7FFF;
+                }
+                if m.neg & 1 != 0 {
+                    h ^= 0x8000;
+                }
+                vec![mods_out(from_f16(h).to_bits(), m)]
+            },
+        ));
+    }
+    // VOP3 clamp precedes narrowing; an f16 result keeps v5's high half.
+    let exact = unary(&[
+        0x4000_0000,
+        0xC000_0000,
+        0x3F00_0000,
+        0xBF00_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x7FC0_0000,
+    ]);
+    for m in [NONE, M { clamp: true, ..NONE }] {
+        p.push(probe(
+            vop3(0x18A, 5, [v(1), 0, 0], m),
+            exact.clone(),
+            F16,
+            move |i| {
+                let x = mods_out(mods_in(ftz(i[0]), 0, m), m);
+                vec![i[3] & 0xFFFF_0000 | to_f16(f64::from(fl(x)), false)]
+            },
+        ));
+    }
     p
 }
 

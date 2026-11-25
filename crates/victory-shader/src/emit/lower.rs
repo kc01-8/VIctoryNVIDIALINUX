@@ -6451,16 +6451,6 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
-            "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded as MODE says (nearest even by default) into the low half.
-                let a = f(self, 0)?;
-                let r = self.narrow16(a);
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("a 16-bit result outside a VGPR");
-                };
-                let r = self.low_half(inst, reg, r);
-                int(self, r)
-            }
             "v_pack_b32_f16" => {
                 // Two f16 sources (op_sel: their high halves; abs and neg on
                 // the sign bit) into the low and high half.
@@ -6485,13 +6475,6 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
-            }
-            "v_cvt_f32_f16" if v.opsel == 0 => {
-                let a = s(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
-                float(self, r)
             }
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
@@ -8268,20 +8251,6 @@ impl<'a> Lower<'a> {
             }
         }
         false
-    }
-
-    /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
-    /// results keep the register's high half (GFX10).
-    fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
-        let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
-        };
-        let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
-        let old = self.s.m.bin(c, Bin::And, old, high);
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        self.s.m.bin(c, Bin::Or, old, x)
     }
 
     /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
@@ -11011,7 +10980,7 @@ mod tests {
     /// Lowers a one-thread compute program that copies four root constants
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -11044,7 +11013,37 @@ mod tests {
             vec![constants, root(RootType::Table, 4, 1)],
             vec![buffer],
         )
-        .map(|_| ())
+    }
+
+    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn vop3_conversion_modifiers_affect_the_lowering() {
+        for (op, first, second, modifier) in [
+            (0x0Au32, 1 << 15, 0, "clamp"),
+            (0x0B, 1 << 8, 0, "abs"),
+            (0x0B, 0, 1 << 29, "neg"),
+        ] {
+            let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
+                .unwrap()
+                .dxil;
+            let vop3 = |first: u32, second: u32| {
+                lower_valu(&[
+                    0xD400_0000 | (0x180 + op) << 16 | first,
+                    0x101 | second,
+                ])
+                .unwrap()
+                .dxil
+            };
+            assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
+            assert_ne!(
+                vop1,
+                vop3(first, second),
+                "VOP3 {modifier} was dropped for op {op:#x}"
+            );
+        }
     }
 
     #[test]
