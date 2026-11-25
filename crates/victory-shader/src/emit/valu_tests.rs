@@ -132,12 +132,16 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         code,
     };
 
+    lower_valu_cs(&native)
+}
+
+fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
     let (p, st) = range::build(&native.code, native.wave64, native.vgprs)?;
     let st = st?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -286,6 +290,154 @@ fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
             assert_eq!(actual, u32::from(inputs[0] == inputs[1]), "{backend}");
         },
     );
+}
+
+#[test]
+fn v_fma_f16_rounds_once_and_preserves_other_half() {
+    use super::host::Stride;
+    use windows::Win32::Graphics::{Direct3D12::*, Dxgi::*};
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    // SAFETY: plain device queries with correctly typed output storage.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory
+            .EnumAdapterByLuid(host.device.GetAdapterLuid())
+            .unwrap();
+        let desc = adapter.GetDesc1().unwrap();
+        let name = String::from_utf16_lossy(&desc.Description);
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .unwrap();
+        eprintln!(
+            "DXGI adapter: {}; lanes {}..{}; shader Wave32 (cs_6_6)",
+            name.trim_end_matches('\0'),
+            options.WaveLaneCountMin,
+            options.WaveLaneCountMax
+        );
+    }
+
+    let mut words = vec![s_mov_b32(1, 0x80), s_mov_b32(3, 0x80)];
+    words.extend(s_load_dwordx4(8, 0)); // input SRV table at s0
+    words.extend(s_load_dwordx4(12, 2)); // output UAV table at s2
+    // buffer_load_dwordx4 v[1:4], off, s[8:11], 0
+    words.extend([0xE038_0000, 0x8002_0100]);
+    words.push(vop1(1, 0, vgpr(4)));
+    words.push(vop1(1, 5, vgpr(4)));
+    words.extend(vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mut high = vop3(0x34B, 5, vgpr(1), vgpr(2), vgpr(3));
+    high[0] |= 1 << 14; // destination op_sel: high half
+    words.extend(high);
+    words.extend(buffer_store_dword(0, 12, 0));
+    words.extend(buffer_store_dword(5, 12, 4));
+    words.push(S_ENDPGM);
+
+    let tables = [(ResourceType::Srv, 0, 0), (ResourceType::Uav, 2, 1)];
+    let shader = lower_valu_cs(&NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: tables
+            .iter()
+            .map(|&(_, user_data, slot)| RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data,
+                slot,
+            })
+            .collect(),
+        used: tables
+            .iter()
+            .map(|&(kind, user_data, slot)| UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data,
+                slot,
+            })
+            .collect(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 3 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    })
+    .expect("build");
+    if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+        std::fs::write(
+            std::path::Path::new(&dir).join("v_fma_f16.dxil"),
+            &shader.dxil,
+        )
+        .unwrap();
+    }
+    if let Some(path) = std::env::var_os("VICTORY_DXIL") {
+        validator::Validator::load(Some(std::path::Path::new(&path)))
+            .unwrap()
+            .validate(&mut shader.dxil.clone())
+            .unwrap();
+        eprintln!("DXIL validated");
+    }
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let mut ud = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = u32::from(u.slot) * 32; // console descriptor byte offset
+    }
+    let seed = 0xABCD_1234;
+    let cases = [
+        ([0x3E00, 0x6C03, 0x0400, seed], 0x6E05), // 1.5 * 4108 + 2^-14
+        ([0x3E00, 0x6C01, 0x8400, seed], 0x6E01), // 1.5 * 4100 - 2^-14
+        ([0x3E00, 0x4000, 0x3C00, seed], 0x4400), // 1.5 * 2 + 1
+        ([0x3E00, 0x6C03, 0, seed], 0x6E04),      // exact tie, lower even
+        ([0x3E00, 0x6C01, 0, seed], 0x6E02),      // exact tie, upper even
+        ([0xBE00, 0x6C03, 0x8400, seed], 0xEE05), // negative midpoint witness
+        ([0x0400, 0x1000, 0, seed], 0),           // tie at half the least subnormal
+        ([0x0400, 0x1000, 1, seed], 2),           // tie between subnormals
+        ([0x7BFF, 0x3C00, 0x4C00, seed], 0x7C00), // overflow midpoint
+    ];
+    let mut results = Vec::new();
+    for (data, half) in cases {
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud.clone()))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(2),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        let expected = [0xABCD_0000 | half, (half << 16) | 0x1234];
+        eprintln!(
+            "inputs {data:08x?}: got {:08x?}, expected {expected:08x?}",
+            out[0]
+        );
+        results.push((out[0].clone(), expected));
+    }
+    for (got, expected) in results {
+        assert_eq!(got, expected);
+    }
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
