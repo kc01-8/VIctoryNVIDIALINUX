@@ -1450,11 +1450,16 @@ impl<'a> Lower<'a> {
                     None if self.s.pixel && self.x.io.initialized_sgprs == Some(n + 2) => {
                         Val::I32(self.s.m.i32(0))
                     }
-                    // The ordered section's collision id, and (`operand`) the
-                    // id of the last wave that left it: 0, so no wave waits;
-                    // the host's rasterizer-ordered views order the accesses.
+                    // The ordered section's collision id (overlap bit 31 clear,
+                    // wave id 1 in bits 16..25, collision id 0 in bits 0..9)
+                    // and (`operand`) the exiting wave id (0): wave id !=
+                    // collision id so `wave_id + ~collision_id` is 0 rather
+                    // than 0xffff_ffff and the wrap-around wait test
+                    // (`s_cmp_lt_u32 s5, s0`) exits immediately even if an
+                    // inactive lane falls through `s_cbranch_vccnz`; the host's
+                    // rasterizer-ordered views order the accesses instead.
                     None if self.pops && self.x.io.initialized_sgprs == Some(n + 1) => {
-                        Val::I32(self.s.m.i32(0))
+                        Val::I32(self.s.m.i32(1 << 16))
                     }
                     None => Val::Missing("a hardware SGPR input"),
                 },
