@@ -97,6 +97,13 @@ impl Shader {
             translated: OnceLock::new(),
         }
     }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn for_test(stage: &'static str, translated: Translated) -> Arc<Shader> {
+        let shader = Shader::new(stage, b"");
+        let _ = shader.translated.set(Some(translated));
+        Arc::new(shader)
+    }
 }
 
 /// A translated shader and the console resources its code reads.

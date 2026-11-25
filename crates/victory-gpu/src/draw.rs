@@ -639,7 +639,7 @@ impl State {
         crate::capture::binding(&p.name);
         // The bound view heap's mark table and the bitmap shaders mark
         // their writes through views in (`crate::shadow::copy_back_marks`).
-        if let Some((table_param, bitmap_param)) = p.marks {
+        let marks = if let Some((table_param, bitmap_param)) = p.marks {
             let heap = match self.heaps[0] {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),
@@ -664,8 +664,11 @@ impl State {
                     l.SetGraphicsRootShaderResourceView(table_param, table);
                     l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
                 }
+                Some((table_param, table, bitmap_param, bitmap))
             }
-        }
+        } else {
+            None
+        };
         // Shaders taking views from the heap itself read (or write) views no
         // table names: everything the bound heap's views reach is brought up
         // to date at submission (`crate::bindless`).
@@ -698,6 +701,10 @@ impl State {
                 unsafe {
                     if compute {
                         l.SetComputeRootSignature(&p.root);
+                        if let Some((tp, table, bp, bitmap)) = marks {
+                            l.SetComputeRootShaderResourceView(tp, table);
+                            l.SetComputeRootUnorderedAccessView(bp, bitmap);
+                        }
                     }
                     l.SetPipelineState(&p.pso);
                 }
@@ -2896,6 +2903,202 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(half, 32768, "16-bit depth at {x},{y}");
             assert_eq!(byte, 0x11, "stencil at {x},{y}");
         }
+    }
+
+    #[test]
+    fn compute_view_marks_rebind_after_depth_twin_conversion() {
+        use victory_shader::emit::{Options, emit_with};
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
+        use victory_shader::{Container, io, ir, resource, structure};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+
+        // Synthetic Wave32 compute shader: loads texel (0, 0) of a 2D depth SRV
+        // at table+0 (`s[8:15]`) and stores the float bits to byte offset
+        // `0x1_0010` (page 1) of a raw buffer UAV at table+0x20 (`s[16:19]`).
+        let code: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+            0xF408_0402,
+            0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_0108,
+            0x0002_0200, // image_load v2, v[0:1], s[8:15] dmask:0x1 dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7E06_02FF,
+            0x0001_0010, // v_mov_b32 v3, 0x10010
+            0xE070_1000,
+            0x8004_0203, // buffer_store_dword v2, v3, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let used_entries = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: used_entries.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host_shader = emit_with(
+            &Container {
+                digest: [0; 16],
+                version: (1, 0),
+                parts: Vec::new(),
+            },
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            Options { view_marks: true },
+        )
+        .unwrap();
+        assert!(host_shader.view_marks);
+        let shader = crate::pipeline::Shader::for_test(
+            "compute",
+            crate::pipeline::Translated {
+                host: host_shader,
+                used: used_entries,
+            },
+        );
+        let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
+        assert!(hp.marks.is_some());
+
+        // 16-bit console depth-stencil texture (`format = 118`) whose twin
+        // requires the compute `converter()` pass when transitioning to SRV.
+        let depth_mem = title_memory(1 << 22);
+        let depth = texture_at_address(depth_mem, &texture_words(64, 64, 118, 0, 2));
+
+        // 2-page tracked guest buffer (`marks.is_some()`): UAV writes go back
+        // only through `VIEW_MARKS` / `VIEW_WRITES` (`copy_back_marks`).
+        let pool_ptr = crate::watch::tests::pool(2);
+        let buf_words: [u32; 14] = [1, 0, 0, 0, 2 << 16, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 4, 0];
+        let dst_buf = texture_at_address(pool_ptr as u64, &buf_words);
+        let dst_shadow =
+            crate::shadow::find(pool_ptr as u64, 2 << 16).expect("tracked shadow buffer");
+        assert!(dst_shadow.marked());
+
+        let null = std::ptr::null();
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let depth_srv: [u32; 10] = [119, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 32768, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, depth, &depth_srv, title_heap.start);
+        crate::descriptor::create_uav(null, dst_buf, null, &raw_uav, title_heap.start + 32);
+
+        // Step 1: Write `49152 / 65535.0` into the 16-bit depth texture's
+        // writable twin UAV in the same command list.
+        let twin_slots = Slots::new(1);
+        let twin_uav = View::Unordered(depth as usize, 0, Some([56, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        twin_slots.make(0, &twin_uav);
+        let write_twin = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<float> d : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    d[id.xy] = 49152.0 / 65535.0;
+}
+"#,
+        );
+
+        let list = host.new_list().unwrap();
+        let copies_before = crate::twin::COPIES.load(Ordering::Relaxed);
+        readable(&list, &used(ResourceType::Uav), &twin_uav, false);
+        run(&list, &twin_slots, &write_twin, 0, None, (8, 8));
+
+        // Step 2: `State::bind` binds `hp.marks`, then `self.tables` makes
+        // `depth` readable as SRV — running `Twin::copy`'s compute converter
+        // and triggering `take_rebind()`, which must restore `hp.marks`.
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title_heap.start);
+        assert!(state.bind(&list, &hp, true));
+        assert!(
+            crate::twin::COPIES.load(Ordering::Relaxed) > copies_before,
+            "depth twin conversion ran during State::bind"
+        );
+        // SAFETY: open command list with compute pipeline and roots bound.
+        unsafe { list.list.Dispatch(1, 1, 1) };
+        list.close();
+        host.execute(&[&list]);
+
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "D3D12 debug layer error after depth-twin compute rebind"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // SAFETY: `pool_ptr` holds 2 pages of live tracked title memory.
+        let bits = unsafe { ((pool_ptr + 0x1_0010) as *const u32).read_volatile() };
+        let got = f32::from_bits(bits);
+        assert!(
+            (got - 49152.0 / 65535.0).abs() < 1e-6,
+            "marked page 1 copied back converted 16-bit depth: {got} ({bits:#x})"
+        );
+
+        type Release = extern "system" fn(This) -> u32;
+        let _ = crate::object::slot::<Release>(heap, 0x10)(heap);
+        let _ = crate::object::slot::<Release>(dst_buf, 0x10)(dst_buf);
+        let _ = crate::object::slot::<Release>(depth, 0x10)(depth);
     }
 
 
