@@ -683,6 +683,10 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if let Some(t) = &self.tracked {
+            // SAFETY: `to - from` bytes inside the mapping, just copied.
+            t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
+        }
         to - from
     }
 }
@@ -1593,6 +1597,48 @@ pub(crate) mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
         unregister(p + 1, p as u64);
+        unregister(p, p as u64);
+    }
+
+    /// A partial refresh of an armed page updates its saved bytes too (both
+    /// under and beside a pending marked range): copy-back neither puts the
+    /// refreshed byte back over a later title write nor drops a shader write
+    /// back to the pre-fault value.
+    #[test]
+    fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let write = |at: usize, v: u8| {
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        };
+        copy.update(p, len);
+        // Arms both pages: page 0 is wholly busy; page 1 past +16 is free.
+        copy.writing(p, PAGE + 16, true);
+        for (at, v) in [(20, 0x55), (24, 0x44), (40, 0x11), (PAGE + 20, 0x55)] {
+            write(at, v);
+        }
+        assert!(copy.update(p + 16, 16) > 0 && copy.update(p + PAGE + 16, 16) > 0);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + 24) as u64, &[0x00]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        write(20, 0x66);
+        write(PAGE + 20, 0x77);
+        copy.copy_back_marked(p);
+        copy.copy_back_marked(p + PAGE);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(
+            [read(10), read(20), read(24), read(40)],
+            [0xaa, 0x66, 0x00, 0x11]
+        );
+        assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
+        copy.copy_back(p, PAGE + 16);
         unregister(p, p as u64);
     }
 
