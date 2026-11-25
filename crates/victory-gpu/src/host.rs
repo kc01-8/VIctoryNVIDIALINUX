@@ -226,10 +226,7 @@ fn create() -> windows::core::Result<Host> {
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
-        match (victory_shader::emit::host::Host {
-            device: device.clone(),
-        })
-        .fuses_fmad()
+        match victory_shader::emit::host::Host::from_device(device.clone()).fuses_fmad()
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
