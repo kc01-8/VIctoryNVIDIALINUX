@@ -307,11 +307,15 @@ pub(crate) fn save(now: bool) {
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
+        // SAFETY: a plain size query on a live library.
+        let size = unsafe { l.library.GetSerializedSize() };
+        let Some(mut bytes) = zeroed(size) else {
+            // Left for a later save: the pipelines stay counted as added.
+            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+            return;
         };
+        // SAFETY: a buffer of the size the library asks for.
+        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
         match bytes {
             Ok(bytes) => {
                 l.added = 0;
@@ -352,6 +356,17 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+/// `n` zero bytes, or `None` when the host has no memory for them. The
+/// library is about 1.7 GB on NVIDIA (each pipeline's machine code), and an
+/// infallible allocation of that size aborted the whole process mid-run
+/// ("memory allocation of 2650101862 bytes failed", RTX 4050 Laptop).
+fn zeroed(n: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -458,6 +473,13 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A size the host cannot give is refused, not fatal; others are zeros.
+    #[test]
+    fn a_save_buffer_the_host_cannot_give_is_refused() {
+        assert!(zeroed(usize::MAX / 2).is_none());
+        assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
