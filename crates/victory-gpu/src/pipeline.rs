@@ -566,6 +566,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
