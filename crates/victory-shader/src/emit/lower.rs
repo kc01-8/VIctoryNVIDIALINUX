@@ -10524,26 +10524,58 @@ impl<'a> Lower<'a> {
     /// so keeping only the last few stays sound.
     fn live_edges(&self) -> HashSet<(Value, usize)> {
         const MAX_KNOWN: usize = 4;
+        /// What is known of the lanes along a path: the last few branch
+        /// conditions taken, in order (a value, not a heap allocation:
+        /// shaders with control flow push thousands of them).
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct Known {
+            conditions: [(Bool, bool); MAX_KNOWN],
+            len: usize,
+        }
+        impl Known {
+            fn get(&self) -> &[(Bool, bool)] {
+                &self.conditions[..self.len]
+            }
+            /// With `c` after the others, the oldest dropped past the limit.
+            fn and(mut self, c: (Bool, bool)) -> Known {
+                if self.len == MAX_KNOWN {
+                    self.conditions.copy_within(1.., 0);
+                    self.len -= 1;
+                }
+                self.conditions[self.len] = c;
+                self.len += 1;
+                self
+            }
+        }
+        let none = Known {
+            conditions: [(Bool::FALSE, false); MAX_KNOWN],
+            len: 0,
+        };
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
-            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, none)).collect();
         let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::new();
+        let mut seen = HashMap::<Value, Vec<Known>>::new();
+        // Whether some lane meets each set of conditions: paths into a join
+        // ask again for the same sets.
+        let mut meets = HashMap::<Known, bool>::new();
         while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
             let done = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
+            if done
+                .iter()
+                .any(|d| d.get().iter().all(|c| known.get().contains(c)))
+            {
                 continue;
             }
-            done.push(known.clone());
+            done.push(known);
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
                 }
-                let mut k = Vec::new();
+                let mut k = none;
                 // Forward edges out of a block that is no loop's latch (a
                 // loop's exit is also taken at its iteration limit).
                 if let LaneExit::Branch {
@@ -10555,14 +10587,12 @@ impl<'a> Lower<'a> {
                     && self.rpo[taken] > self.rpo[q]
                     && self.rpo[not_taken] > self.rpo[q]
                 {
-                    k.clone_from(&known);
-                    k.push((when, taken == b));
-                    k.drain(..k.len().saturating_sub(MAX_KNOWN));
-                    if !st.bools.meet(&k) {
+                    k = known.and((when, taken == b));
+                    if !*meets.entry(k).or_insert_with(|| st.bools.meet(k.get())) {
                         continue;
                     }
                 } else if self.rpo[q] < self.rpo[b] {
-                    k.clone_from(&known);
+                    k = known;
                 }
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
