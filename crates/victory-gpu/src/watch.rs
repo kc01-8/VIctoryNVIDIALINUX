@@ -674,26 +674,39 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
+    let guarded = g.protected.range(first..last).next().is_some();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
+    // Every page's bytes are saved before any is opened: once a page is
+    // open, a write by another thread lands without a fault, and a save
+    // after it would keep that write as the page's old bytes.
+    mark_changed(g, first, last, save);
+    for &page in &others {
+        mark_changed(g, page, page + 1, save);
+    }
+    open_guarded(g, first, last);
     for page in others {
-        changed_here(g, page, page + 1, save);
+        open_guarded(g, page, page + 1);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+/// Gives write access back to the pages of `[first, last)` we guarded.
+fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
+    for page in guarded {
         open(g, page);
     }
+}
+
+/// Marks `[first, last)` changed in the trackers holding its pages. With
+/// `save`, before the write lands: trackers armed for a page they had taken
+/// keep its bytes.
+fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -708,7 +721,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
