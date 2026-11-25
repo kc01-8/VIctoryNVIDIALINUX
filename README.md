@@ -64,6 +64,14 @@ repository then fetches the pinned toolchain. Building needs the MSVC C++
 build tools: Visual Studio or its Build Tools with the "Desktop development
 with C++" workload.
 
+Keep the build paths short. From a checkout about 170 characters deep, the
+`blake3` dependency's build script fails in `ml64.exe` with
+`A1009: line too long`, even with long paths enabled in Windows, because
+its object files land under `target`. Set `CARGO_TARGET_DIR` to a short
+absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
+in `C:\vt\release` instead of `target\release`), or check out the
+repository nearer the drive's root.
+
 A run in the world takes about 33 GB of Windows commit (RAM plus paging
 file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
 and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
