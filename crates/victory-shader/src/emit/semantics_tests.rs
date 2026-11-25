@@ -1527,6 +1527,17 @@ fn class_compares_match_the_hardware() {
 fn conversion_probes() -> Vec<Probe> {
     let xs = unary(F32_EDGES);
     let ints = unary(U32_EDGES);
+    let mut unsigned = U32_EDGES.to_vec();
+    // Two observed WARP misroundings, then the neighbors of midpoints
+    // with even and odd lower significands at every inexact exponent.
+    unsigned.extend([0xDE84_975E, 0xFFFF_FF7F]);
+    for exponent in 24..32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            unsigned.extend([midpoint - 1, midpoint, midpoint + 1]);
+        }
+    }
     let mut p = vec![
         probe([vop1(0x08, 5, v(1))], xs.clone(), INT, |i| {
             vec![to_i32(i[0])]
@@ -1556,7 +1567,7 @@ fn conversion_probes() -> Vec<Probe> {
         probe([vop1(0x05, 5, v(1))], ints.clone(), F32, |i| {
             vec![(i[0] as i32 as f32).to_bits()]
         }),
-        probe([vop1(0x06, 5, v(1))], ints.clone(), F32, |i| {
+        probe([vop1(0x06, 5, v(1))], unary(&unsigned), INT, |i| {
             vec![(i[0] as f32).to_bits()]
         }),
         // An f16 result keeps the destination's high half (v5 = d).
