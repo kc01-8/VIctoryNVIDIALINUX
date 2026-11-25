@@ -10335,9 +10335,14 @@ impl<'a> Lower<'a> {
                         regs.insert(r);
                         tainted.insert(w);
                     }
-                } else if guard.is_none() {
-                    for w in &inst.writes {
-                        regs.remove(&w.0);
+                } else {
+                    // Only VGPR writes keep their old value under a lane guard;
+                    // SGPR and SCC writes (e.g. `v_readfirstlane_b32`, `v_cmp_*`)
+                    // always overwrite the register unconditionally.
+                    for &(r, _) in &inst.writes {
+                        if guard.is_none() || !matches!(r, Reg::V(_)) {
+                            regs.remove(&r);
+                        }
                     }
                 }
             }
@@ -11913,6 +11918,43 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(refusal(&kept), None);
+    }
+
+    #[test]
+    fn a_guarded_scalar_write_kills_a_stale_sgpr() {
+        // s6 holds a missing value (timestamp) where s0 == 0 and 5 where
+        // s0 != 0; the flag in v1 skips the first read on the s0 == 0 path.
+        // After that, inside a guarded region (EXEC narrowed without a
+        // branch), `v_readfirstlane_b32` overwrites s6 unconditionally before
+        // s6 is read again.
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> after
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> after
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x7DA4_0080, // after: v_cmpx_eq_u32 exec_lo, 0, v0 (narrows EXEC)
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0 (guarded, writes SGPR)
+            0x7DA4_0006, // v_cmpx_eq_u32 exec_lo, s6, v0 (reads new s6)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        lowers(&words, group_ids_xy).expect("guarded v_readfirstlane overwrites stale s6");
+        // Without the overwrite, the guarded compare reads the stale s6.
+        let mut no_kill = words;
+        no_kill[13] = 0xBF80_0000; // s_nop 0
+        assert!(lowers(&no_kill, group_ids_xy).is_err());
+        // With the flag set on both paths, the earlier read sees the stale s6.
+        words[2] = 0x7E02_02C1; // v_mov_b32 v1, -1
+        assert!(lowers(&words, group_ids_xy).is_err());
     }
 
     #[test]
