@@ -294,10 +294,19 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Guards the other mappings of taken pages.
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
+/// Guards the other mappings of taken pages, returning those that still
+/// have an unguarded mapping (cannot be taken yet).
+fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
+    if pairs.is_empty() {
+        return BTreeSet::new();
+    }
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    protect(g, &others);
+    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
+    pairs
+        .iter()
+        .filter(|(_, a)| !guarded.contains(a))
+        .map(|&(p, _)| p)
+        .collect()
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -482,7 +491,7 @@ impl Tracked {
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let whole: Vec<usize> = pages
+        let mut whole: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
@@ -498,9 +507,10 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
+        let unguarded = guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
+        whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
         for page in protect_noting(&mut g, &whole, &mut unmapped) {
             changed.remove(&page);
@@ -536,8 +546,13 @@ impl Tracked {
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
-        guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        let unguarded = guard_aliases(&mut g, &others);
+        let pages: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|p| !unguarded.contains(p))
+            .collect();
+        for page in protect(&mut g, &pages) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -859,8 +874,13 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
         }
     }
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
-        protect(&mut g, &[page]);
+    // If the new mapping cannot be guarded (a write the guards do not see is
+    // under way through it), the page is changed; its bytes now may hold that
+    // write already, so nothing is saved of them.
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
+        && protect(&mut g, &[page]).is_empty()
+    {
+        changed(&mut g, page, page + 1, false);
     }
 }
 
@@ -1381,6 +1401,40 @@ pub(crate) mod tests {
         // SAFETY: a page of our pool, guarded: the handler opens it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
         assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
+    }
+
+    /// A write under way on another mapping of a page keeps the page open
+    /// there, so taking the page (or marking it taken) through its tracked
+    /// mapping must leave it changed and keep what was saved of it; aliasing
+    /// a busy mapping to a guarded one must mark the guarded page changed.
+    #[test]
+    fn a_busy_alias_leaves_the_page_changed_and_keeps_saved_bytes() {
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        t.arm(a, a + PAGE);
+        let write = writing(b, 16);
+        assert!(t.changed(a / PAGE));
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.changed(a / PAGE), "take must leave the page changed");
+        t.taken(&[a / PAGE]);
+        assert!(t.changed(a / PAGE), "taken must leave the page changed");
+        // SAFETY: the second view of the page, kept open by `write`.
+        unsafe { (b as *mut u32).write_volatile(0x1234) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        drop(write);
+        let saved = t.saved(a / PAGE).expect("saved bytes survive");
+        assert_eq!(&saved[..4], &[0, 0, 0, 0]);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty(), "taken once the write ended");
+        let (c, _) = twin_views(1);
+        let busy_c = writing(c, 16);
+        title_memory_aliased(c, &[a]);
+        assert!(
+            t.changed(a / PAGE),
+            "aliasing a busy page marks the tracked one"
+        );
+        drop(busy_c);
     }
 
     /// A write or mapping that runs past the end of the address space (a
