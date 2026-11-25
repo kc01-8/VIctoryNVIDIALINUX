@@ -3070,3 +3070,50 @@ fn lds_bytes_and_halves_match_the_hardware() {
         }),
     ]));
 }
+
+/// DS `op` with both offset bytes: `offset0` | `offset1` << 8.
+fn ds_at(op: u32, vdst: u8, addr: u8, data: u8, offset: u16) -> [u32; 2] {
+    [
+        0xD800_0000 | op << 18 | u32::from(offset),
+        u32::from(vdst) << 24 | u32::from(data) << 8 | u32::from(addr),
+    ]
+}
+
+/// LDS accesses past the program's allocation (512 bytes here) read 0 and
+/// drop writes (RDNA2 ISA DS), for dwords, bytes, read2 and returning
+/// atomics; a dropped write must not land in bounds, an address that wraps
+/// at 32 bits back inside is inside, and lanes EXEC leaves out keep their
+/// registers. Each thread uses its
+/// own dword and the dword 512 bytes past it.
+#[test]
+fn lds_out_of_bounds_reads_zero_and_drops_writes() {
+    let inputs = pairs(U32_EDGES, &U32_EDGES[..10]);
+    let mut plain = vec![vop2(0x1A, 11, int(2), 0)];
+    plain.extend(ds_at(0x0D, 0, 11, 1, 0)); // ds_write_b32 [own], a
+    plain.extend(ds_at(0x0D, 0, 11, 2, 512)); // ds_write_b32 [own + 512], b
+    plain.extend(ds_at(0x36, 5, 11, 0, 0)); // ds_read_b32 v5, [own]
+    plain.extend(ds_at(0x36, 6, 11, 0, 512)); // ds_read_b32 v6, [own + 512]
+    plain.extend(ds_at(0x36, 7, 11, 0, 0xFFFC)); // ds_read_b32 v7, [own + 65532]
+    plain.extend(ds_at(0x39, 8, 11, 0, 600)); // ds_read_i8 v8, [own + 600]
+    let mut more = vec![vop2(0x1A, 11, int(2), 0)];
+    more.extend(ds_at(0x0D, 0, 11, 1, 0)); // ds_write_b32 [own], a
+    more.extend(ds_at(0x1E, 0, 11, 2, 513)); // ds_write_b8 [own + 513], b
+    more.extend(ds_at(0x37, 5, 11, 0, 200 << 8)); // ds_read2_b32 v[5:6], [own], [own + 800]
+    more.extend(ds_at(0x20, 7, 11, 2, 512)); // ds_add_rtn_u32 v7, [own + 512], b
+    // The address wraps at 32 bits, as LLVM's DS offset folding takes it
+    // on CI and later (a base below 0 plus the offset): own - 16 + 16.
+    more.push(vop2(0x25, 12, 208, 11)); // v_add_nc_u32 v12, -16, v11
+    more.extend(ds_at(0x36, 8, 12, 0, 16)); // ds_read_b32 v8, [own - 16 + 16]
+    // Lanes EXEC leaves out keep the old register; active lanes outside
+    // the LDS get 0 from a returning atomic.
+    let mut masked = vec![vop2(0x1A, 11, int(2), 0)];
+    masked.push(vopc(0xC4, v(1), 2)); // v_cmp_gt_u32 vcc, v1, v2
+    masked.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+    masked.extend(ds_at(0x20, 5, 11, 2, 512)); // ds_add_rtn_u32 v5, [own + 512], b
+    masked.push(sop1(0x03, 126, s(20)));
+    assert_clean(check(&[
+        probe(plain, inputs.clone(), INT, |i| vec![i[0], 0, 0, 0]),
+        probe(more, inputs.clone(), INT, |i| vec![i[0], 0, 0, i[0]]),
+        probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
+    ]));
+}
