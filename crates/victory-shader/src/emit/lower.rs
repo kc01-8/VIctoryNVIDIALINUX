@@ -10437,25 +10437,41 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// The instruction writing `v`.
-    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+    /// The block, instruction index, and instruction writing `v`.
+    fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
         let b = *self.def_block.get(&v)?;
-        let p = self.x.p;
-        p.blocks[b]
+        let (i, inst) = self.x.p.blocks[b]
             .insts
             .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
+            .enumerate()
+            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
+        Some((b, i, inst))
     }
 
-    /// The constant `v` holds, `env` giving phi values: moves of constants.
+    /// The instruction writing `v`.
+    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+        self.def_site(v).map(|(_, _, inst)| inst)
+    }
+
+    /// The constant `v` holds, `env` giving phi values: unguarded moves of
+    /// unmodified constants.
     fn konst(&self, env: &HashMap<Value, u32>, v: Value) -> Option<u32> {
         if let Some(&k) = env.get(&v) {
             return Some(k);
         }
-        let inst = self.def_inst(v)?;
+        let (b, i, inst) = self.def_site(v)?;
+        if self.x.st.guards[b][i].is_some() {
+            return None;
+        }
         let op = match &inst.fields {
             Fields::Valu(w)
-                if inst.name() == "v_mov_b32" && w.sdwa.is_none() && w.dpp.is_none() =>
+                if inst.name() == "v_mov_b32"
+                    && w.sdwa.is_none()
+                    && w.dpp.is_none()
+                    && w.abs == 0
+                    && w.neg == 0
+                    && !w.clamp
+                    && w.omod == 0 =>
             {
                 w.src.first()?
             }
@@ -11780,6 +11796,74 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+    }
+
+    #[test]
+    fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
+        let group_ids_xy = 3 << 7;
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert!(refusal(&direct).is_some());
+
+        // Guarded `v_mov_b32 v1, 0`: inactive lanes (v0 != 0) preserve v1 = -1,
+        // so they pass the compare after the join and read s6 (`s_memtime`).
+        let mut guarded = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0280, // v_mov_b32 v1, 0 (guarded)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&guarded), refusal(&direct));
+        // Without the EXEC guard, `v_mov_b32 v1, 0` writes every lane and s6 is dead.
+        guarded[3] = 0xBF80_0000; // s_nop 0
+        guarded[5] = 0xBF80_0000; // s_nop 0
+        lowers(&guarded, group_ids_xy).expect("unguarded v_mov_b32 still folds");
+
+        // VOP3 `v_mov_b32_e64 v1, -(1.0)`: neg modifier flips 1.0f to -1.0f,
+        // matching the compare after the join so s6 is live.
+        let mut negated = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xD581_0001,
+            0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02F3, // v_mov_b32 v1, -1.0
+            0x7D84_02F3, // join: v_cmp_eq_u32 vcc_lo, -1.0, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&negated), refusal(&direct));
+        // Clearing the neg bit yields unmodified 1.0f (!= -1.0f), so s6 is dead.
+        negated[3] = 0x0000_00F2; // v_mov_b32_e64 v1, 1.0
+        lowers(&negated, group_ids_xy).expect("unmodified v_mov_b32_e64 still folds");
     }
 
     #[test]
