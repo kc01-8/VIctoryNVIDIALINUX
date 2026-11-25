@@ -10,10 +10,11 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 
 ## Status (2026-11-25)
 
-**Not playable yet, but you can get into the game.** The title boots, runs
-its menus at its own 30 fps, loads the world, plays the intro cutscene and
+**Not playable yet, because of the framerate: about 1 frame per second in the
+world.** Nothing else keeps the game from working: the title boots, runs its
+menus at its own 30 fps, loads the world, plays the intro cutscene and
 reaches the **prologue**, the mission after it, with the graphics fully
-displayed, at about **1 frame per second**.
+displayed. 
 
 | Stage | State |
 |-------|-------|
