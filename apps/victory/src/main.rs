@@ -10,6 +10,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -91,9 +92,9 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Positive worker thread count (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
         /// (with `--pipelines`, then the shader pack's pipelines).
@@ -173,7 +174,7 @@ fn main() -> Result<()> {
             pipelines,
             cache: true,
             ..
-        } => translate::warm(paths, jobs, pipelines),
+        } => translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines),
         Command::Translate {
             paths,
             validate,
@@ -181,7 +182,13 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+        ),
         Command::Run {
             exe,
             unimplemented,
