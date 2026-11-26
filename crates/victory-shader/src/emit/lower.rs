@@ -895,6 +895,38 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut list = Vec::new();
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r {
+                        continue;
+                    }
+                    for i in &block.insts {
+                        let name = i.name();
+                        if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                            continue;
+                        }
+                        // the address register and the instruction that wrote it
+                        let addr = match &i.fields {
+                            Fields::Ds { addr: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } => {
+                                let made = i.read(Reg::V(*reg)).and_then(|v| {
+                                    p.blocks
+                                        .iter()
+                                        .flat_map(|bl| &bl.insts)
+                                        .find(|x| x.writes.iter().any(|w| w.1 == v))
+                                        .map(|x| format!("{:#x} {}", x.machine.offset, x.name()))
+                                });
+                                format!("v{reg} off {offset0}/{offset1} made by {}", made.as_deref().unwrap_or("an input or a phi"))
+                            }
+                            _ => "no address".to_string(),
+                        };
+                        list.push(format!("{:#x} {name} [{addr}]", i.machine.offset));
+                    }
+                }
+                eprintln!("WAVE64-LDS region with reads and writes: {}", list.join("; "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];

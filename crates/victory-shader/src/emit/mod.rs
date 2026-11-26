@@ -428,17 +428,45 @@ pub fn emit(
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
-        let form = |p: Option<ir::Program>| {
-            p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
-                Some((p, st, io, res))
-            })
+        // `VICTORY_WAVE_WHY`: why a form is missing (no such branch, or the
+        // stage that refused the changed program, with its reason).
+        let form_why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let form = |label: &str, p: Option<ir::Program>| {
+            let say = |what: &dyn std::fmt::Display| {
+                if form_why {
+                    eprintln!("WAVE64-FORM {label}: {what}");
+                }
+            };
+            let Some(p) = p else {
+                say(&"not made (no such branch in the program, or its blocks could not be made reducible)");
+                return None;
+            };
+            let st = match structure::structure(&p) {
+                Ok(st) => st,
+                Err(e) => {
+                    say(&format_args!("structure: {e}"));
+                    return None;
+                }
+            };
+            let io = match io::raise(&p, native) {
+                Ok(io) => io,
+                Err(e) => {
+                    say(&format_args!("io: {e}"));
+                    return None;
+                }
+            };
+            let res = match resource::track(&p, &native.layout, native.stage, Some(&st)) {
+                Ok(res) => res,
+                Err(e) => {
+                    say(&format_args!("resources: {e}"));
+                    return None;
+                }
+            };
+            Some((p, st, io, res))
         };
         let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
-            ("without skips", form(ir::without_skips(p, false))),
+            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
+            ("without skips", form("without skips", ir::without_skips(p, false))),
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
@@ -469,7 +497,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
