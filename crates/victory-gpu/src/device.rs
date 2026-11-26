@@ -420,14 +420,16 @@ fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
         let mut b = vec![0u8; n];
         (at != 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
     };
-    let Some(d) = read(desc, 0x80) else {
+    let Some(d) = read(desc, 0x100) else {
         return;
     };
     let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
-    let key = if slot == 0x218 { w(11) } else { w(5) ^ (w(9) << 1) };
+    // 0x218: its code pointer (word 11 is not a key: gfx41); 0x1c8: the
+    // code pointers of words 5 and 9.
+    let key = if slot == 0x218 { w(5) } else { w(5) ^ (w(9) << 1) };
     {
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(&(slot, key)) || seen.len() >= 4096 {
+        if seen.contains(&(slot, key)) || seen.len() >= 16384 {
             return;
         }
         seen.push((slot, key));
@@ -438,7 +440,19 @@ fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
     if let Some(r) = read(w(0) as usize, 0x80) {
         let _ = std::fs::write(sub.join("root.bin"), r);
     }
-    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11] };
+    // The root signature's serialized form, once per root object.
+    {
+        static ROOTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if !roots.contains(&w(0)) {
+            roots.push(w(0));
+            if let Some(b) = crate::root::blob(w(0) as usize as crate::object::This) {
+                let _ = std::fs::create_dir_all(dir.join("roots"));
+                let _ = std::fs::write(dir.join("roots").join(format!("{:x}.bin", w(0))), b);
+            }
+        }
+    }
+    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11, 13, 15] };
     for &i in pairs {
         let (at, size) = (w(i) as usize, w(i + 1) as usize);
         if at == 0 || size == 0 || size > 1 << 20 {
