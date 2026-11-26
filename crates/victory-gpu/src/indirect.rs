@@ -885,7 +885,10 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
 /// about 1,450 draws a frame each had a compute pass of ours in front of
 /// them: the card left drawing for compute and came back, about nine
 /// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+///
+/// The third value: a segment's pass was recorded in the list for the record ([`gather_segments`]): the caller binds
+/// its own pipeline and root signature again.
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
     end_window(list);
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
@@ -894,6 +897,140 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
         return None;
     };
     list.gather_slot(src, src_id, offset, spec)
+}
+
+/// The records a segment's pass clamps at most ([`record_segment`]): one group of the clamp, one dispatch.
+pub(crate) const SEGMENT_PASS: u32 = 64;
+/// The passes a list records at most in one recording: its buffer of slots holds `SEGMENT_PASSES * SEGMENT_PASS`
+/// records of [`GATHER_STRIDE`] bytes (128 KiB).
+pub(crate) const SEGMENT_PASSES: u32 = 64;
+
+/// Whether a list that stopped gathering for its prelude ([`gather`]) gathers in segments (`VICTORY_GATHER_SEGMENTS=1`,
+/// with `VICTORY_INDIRECT_GATHER=1`; off by default; `alt`: twenty seconds with, twenty without, in turn, each change
+/// said in the log). After flipflop877/victory-nvidia-8gb-16fps c69bff19, ported onto this clamp's counted table
+/// (bit 16, as `windowed`).
+///
+/// A list stops gathering at the first command that may write arguments (`State::gather_ends`: a dispatch, a draw
+/// whose shaders may store, an indirect command that is not windowed): the prelude runs before the list, so it cannot
+/// clamp a record written inside it. Every record drawn after that had a pass of its own, between two waits for every
+/// earlier shader write. With the switch the stretch from one such command to the next is a segment: the first record
+/// of a segment (per argument buffer, kind and stride) records ONE pass in the list right there, after the command that
+/// may have written it, and the records drawn after it in the segment take slots that pass fills. The pass reads how
+/// many it has from its table's first word, which the CPU writes as records are taken and the card reads when the list
+/// runs.
+///
+/// Exact as a pass of its own per draw: the pass runs after every command recorded before it (the same full wait for
+/// shader writes first) and before the first draw that reads one of its slots, and nothing between it and those draws
+/// may write arguments: every `State::gather_ends` with stores (whole or by copy), every `HostList::gather_close` and
+/// `gather_wrote` ends all open segments ([`HostList::segments_end`]), and so do the list's close and reset. The rest
+/// of what is recorded between writes no buffer the records come from: our own clamps, windows and gathers write their
+/// scratch buffers; texture copies write textures; read-backs land in buffers of ours; the title's buffer copies and
+/// the host copies' refreshes run before the list (`card_before`), for the pass as for each single clamp. Each draw
+/// takes a slot of its own, so a record drawn twice is clamped and charged twice. The records charge the list's own
+/// budget word as their single clamps did, in draw order within a pass; what moves is that a pass charges its records
+/// when it runs, before passes of ours recorded between its draws: that shows only when the list's budget runs out
+/// (2^27 vertex instances or threads).
+pub(crate) fn gather_segments() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_SEGMENTS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("records after a list stops gathering are gathered in segments, a pass of ours per segment from now (VICTORY_GATHER_SEGMENTS=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// Whether an indirect dispatch's own record (one record, no count buffer, not spread) takes a slot of the prelude or
+/// of a segment as a draw's does, and the dispatch ends the gathering after that (`VICTORY_GATHER_DISPATCHES=1`, with
+/// `VICTORY_INDIRECT_GATHER=1`; off by default; `alt` as above). Its record is read before the dispatch runs, and
+/// nothing since the list's last command that may write arguments wrote it.
+pub(crate) fn gather_dispatches() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_DISPATCHES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("indirect dispatches take gathered slots for their own record from now (VICTORY_GATHER_DISPATCHES=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// Since the start, with [`gather_segments`]: records taken by segments' passes (each had a pass of its own before),
+/// the passes, the records that found no room (the list's passes all used, or no clamp or buffer) and were clamped
+/// alone, as before.
+pub(crate) static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Records, in `l`, a segment's pass ([`gather_segments`]): up to [`SEGMENT_PASS`] records of `kind` and `stride` from
+/// `src`, record `i` at the byte offset that word `i + 1` of the table at `table_gpu` names, as many as its word 0 says
+/// when the list runs; stored clamped at `at + i * stride` of `dst` (in state `before`), which is left in
+/// `INDIRECT_ARGUMENT`; charged to the budget word at `budget`. Waits for every earlier shader write first, as a single
+/// clamp does. Replaces the list's compute root signature and pipeline. False, with nothing recorded, if the layout or
+/// the addresses do not fit the clamp.
+pub(crate) fn record_segment(
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    at: u64,
+    budget: u64,
+    src: &ID3D12Resource,
+    table_gpu: u64,
+    (kind, stride): (u32, u32),
+) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    // SAFETY: live D3D12 buffer resources.
+    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + at) };
+    if gatherable(src_gpu, 0, (kind, stride)).is_none() || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || !table_gpu.is_multiple_of(4) {
+        return false;
+    }
+    // Bit 2: gathered from the table; bit 16: its first word is the count, the offsets follow.
+    let constants = [kind, stride, SEGMENT_PASS, 0u32, 4u32 | 16u32, 0u32];
+    let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+    let second = [
+        uav_barrier(),
+        transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    ];
+    let timed = crate::cardmeter::clamp_begin(l);
+    // SAFETY: an open list; our root signature and pipeline; live source, table (the list's upload memory), slot
+    // buffer and budget. Moving the slot buffer out of `INDIRECT_ARGUMENT` orders this pass after the reads of the
+    // slots earlier passes filled. Threads past the table's count return at once and charge nothing.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, table_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    crate::cardmeter::end(l, timed);
+    true
 }
 
 /// `VICTORY_GATHER_BY_COPY`: 0 off, 1 on, 2 in turn.
