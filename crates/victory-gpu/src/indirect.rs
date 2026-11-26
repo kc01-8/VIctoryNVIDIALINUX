@@ -428,7 +428,7 @@ fn clamp_into(
     spread: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread);
+    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread, true);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -451,7 +451,7 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, false)
+    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, false, false)
 }
 
 /// [`record_clamp_as`]; `spread`: dispatch records past 65,535 groups in x
@@ -468,6 +468,7 @@ fn record_clamp_with(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
     spread: bool,
+    lean: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -547,6 +548,13 @@ fn record_clamp_with(
         ),
     ];
     let skip = usize::from(!waits);
+    // With `VICTORY_CLAMP_LEAN`: after the clamp only `dst`'s own
+    // transition, no wait for every shader write ([`clamp_lean`]).
+    let skip_second = if lean && clamp_lean() { 1 } else { skip };
+    // The card meter's sample of clamps (`VICTORY_CARD_METER_CLAMPS`): a
+    // timestamp before the first barrier and one after the second, nothing
+    // else recorded differently.
+    let timed = crate::cardmeter::clamp_begin(l);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -560,9 +568,56 @@ fn record_clamp_with(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
+    crate::cardmeter::end(l, timed);
     true
+}
+
+/// Whether the clamp of a title's indirect command (`bound`, `bound_ahead`)
+/// ends with `dst`'s transition alone, without the wait for every earlier
+/// shader write that came with it (`VICTORY_CLAMP_LEAN=1`; off by default;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log). The first barrier, which orders the title's argument and count
+/// passes before the clamp reads them, stays as it is.
+///
+/// Why it is exact: what the clamp writes is `dst` and the budget words.
+/// `dst` goes UNORDERED_ACCESS -> INDIRECT_ARGUMENT, and that transition is
+/// what makes the clamp's writes to it visible to the execution that reads
+/// it as arguments. The budget words are touched by the clamp shader only
+/// through atomic operations (`InterlockedOr`, `InterlockedCompareExchange`,
+/// `InterlockedMax`, `InterlockedAdd`), which need no barrier between two
+/// clamps, and the card copy of them is copied out at the list's end behind
+/// its own transition (`HostList::card_budget_out`). The window check's
+/// clamps (`record_clamp_as`) keep both waits.
+///
+/// Why it may gain little: the transition still waits for the clamp's
+/// dispatch to finish, so the card stops once per clamp either way. The
+/// clamp meter (`VICTORY_CARD_METER_CLAMPS`) says it: the clamp's span in
+/// ON phases against off.
+fn clamp_lean() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CLAMP_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a clamp of an indirect command ends with its arguments' transition alone from now (VICTORY_CLAMP_LEAN=alt): {}",
+                    if on { "ON" } else { "off, with the wait for every shader write as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// The most records of one argument buffer gathered for a list
@@ -1586,6 +1641,7 @@ void main() {
             (KIND_DISPATCH, STRIDE, records.len() as u32),
             false,
             true,
+            false,
         ));
         // SAFETY: open command list; the clamp left `dst_buf` in `INDIRECT_ARGUMENT`.
         unsafe {
