@@ -4431,7 +4431,13 @@ impl State {
             .flatten()
             .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
         let is_spread = spread.is_some();
-        let Some(signature) = spread.or_else(|| {
+        // Lean (`VICTORY_SPREAD_LEAN`): the records within 65,535 groups go
+        // through the plain dispatch signature, and the spread signature
+        // runs only under a predicate the clamp sets when a record passes it.
+        let plain = (is_spread && max > 0 && max <= crate::indirect::LEAN_RECORDS && spread_lean_on())
+            .then(|| host_signature(DISPATCH, 12))
+            .flatten();
+        let Some(signature) = spread.clone().or_else(|| {
             matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
                 .then(|| host_signature(kind, stride))
                 .flatten()
@@ -4516,6 +4522,9 @@ impl State {
             // The dispatch's record is taken (or clamped alone below): what the dispatch writes, from here on.
             self.gather_ends(list, true);
         }
+        // With a lean clamp: the predicate word's and the spread records'
+        // offsets in `bounded` (the plain records are at 0).
+        let mut lean = None;
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
@@ -4630,6 +4639,12 @@ impl State {
                 {
                     window_at = Some((at, opened));
                     Some(dst)
+                } else if let Some((dst, pred, spread_at)) = plain
+                    .as_ref()
+                    .and_then(|_| crate::indirect::bound_lean(list, (&args.buffer, offset), count_arg, (kind, step, records)))
+                {
+                    lean = Some((pred, spread_at));
+                    Some(dst)
                 } else {
                     // (A spread dispatch is never windowed: `windowed` is
                     // false for dispatches.)
@@ -4711,18 +4726,26 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
+        let count_offset = counter.as_ref().map_or(0, |(s, at)| s.offset(*at));
+        if let (Some(plain), Some((pred, spread_at))) = (plain.as_ref().filter(|_| lean.is_some()), lean) {
+            // SAFETY: as below. `bound_lean` left `bounded` in
+            // `INDIRECT_ARGUMENT`, which is also the predication state; the
+            // bound program's spread words are 0 for the plain records (its
+            // bind sets them so for an indirect dispatch), and the spread
+            // signature sets them for the spread ones. Predication is off
+            // again before anything else is recorded.
+            unsafe {
+                list.list.ExecuteIndirect(plain, max, &bounded, 0, count_buffer, count_offset);
+                list.list.SetPredication(&bounded, pred, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                list.list.ExecuteIndirect(&signature, max, &bounded, spread_at, count_buffer, count_offset);
+                list.list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
+        } else {
+            // SAFETY: an open list with everything set; the scratch buffer and
+            // host copies are kept alive by the list, and the signature is cached.
+            unsafe { list.list.ExecuteIndirect(&signature, max, &bounded, at, count_buffer, count_offset) };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4733,6 +4756,9 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if is_spread {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
+                if lean.is_some() {
+                    SPREAD[2].fetch_add(1, Ordering::Relaxed);
+                }
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4745,8 +4771,9 @@ impl State {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 /// Dispatches spread across z since the frame line last took them: direct,
-/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
-pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]), and of the
+/// indirect ones those run lean ([`spread_lean_on`]).
+pub(crate) static SPREAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// `COMPUTE_DISPATCH_INITIATOR` bit 5, `USE_THREAD_DIMENSIONS`: a
 /// `DispatchX` whose `x`, `y`, `z` count threads, not groups; in the last
@@ -4817,6 +4844,42 @@ fn spread_on() -> bool {
                 tracing::info!(
                     "dispatches past 65,535 groups are spread across z from now (VICTORY_DISPATCH_SPREAD=alt): {}",
                     if on { "ON" } else { "off, clamped to 65,535 as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether a spread indirect dispatch of at most
+/// [`crate::indirect::LEAN_RECORDS`] records runs lean
+/// (`VICTORY_SPREAD_LEAN`: off by default; `1` on; `alt` twenty seconds
+/// with, twenty without, in turn, each change said in the log): the clamp
+/// writes its records within 65,535 groups in x for the plain dispatch
+/// signature and the others for the spread signature, which runs under a
+/// predicate the clamp sets only when a record passes 65,535. An
+/// `ExecuteIndirect` whose signature sets root constants costs far more on
+/// some cards than a plain one (an RTX 3060: about 13 ms of the card's time
+/// a frame for ~1,000 of them, of which ~1 a frame passes 65,535), and
+/// nothing is clamped to 65,535 either way.
+fn spread_lean_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "indirect dispatches spread across z run lean from now (VICTORY_SPREAD_LEAN=alt): {}",
+                    if on { "ON" } else { "off, every record through the spread signature" }
                 );
             }
             on
