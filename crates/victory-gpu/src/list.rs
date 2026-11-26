@@ -756,6 +756,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        // What the dispatches before it wrote is seen from here on: a
+        // segment that outlived them ends (`crate::indirect::segments_across`).
+        if count > 0 && crate::indirect::segments_across() {
+            list.segments_end();
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))

@@ -115,8 +115,8 @@ pub(crate) enum Cast {
 /// `opt::FAST`, as LLVM 3.7 bitcode writes them: 1 unsafe algebra (which
 /// in 3.7 implies all the others), 2 no NaNs, 4 no infinities, 8 no signed
 /// zeros, 16 allow reciprocal. `VICTORY_SHADER_FAST_BITS` (a number) picks
-/// them; unset, 1 (every flag, as the HLSL compiler writes a non-precise
-/// operation). With unsafe algebra or no-NaNs/no-infinities a driver may
+/// them; unset, 24 (no signed zeros and reciprocal: with 1, every flag,
+/// runs 354/355 showed black blotches on skin and clothes). With unsafe algebra or no-NaNs/no-infinities a driver may
 /// take an operation's result as never NaN or infinite and fold a later
 /// test of it (`fcmp uno`, a compare against infinity) to a constant; 24
 /// (no signed zeros, reciprocal) keeps NaN and infinity tests but may also
@@ -134,7 +134,7 @@ fn fast_math_bits() -> u64 {
                     None => v.parse().ok(),
                 }
             })
-            .map_or(1, |b| b & 0x1F)
+            .map_or(24, |b| b & 0x1F)
     })
 }
 

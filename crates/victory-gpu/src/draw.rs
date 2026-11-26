@@ -3333,6 +3333,28 @@ impl State {
         }
     }
 
+    /// [`State::gather_ends`] for a dispatch: with
+    /// `crate::indirect::segments_across` the open segment is marked, not
+    /// ended (the prelude's gathering still ends, whole or by copy).
+    fn dispatch_ends(&self, list: &HostList) {
+        if !crate::indirect::segments_across() {
+            return self.gather_ends(list, true);
+        }
+        let whole = !crate::indirect::gather_by_copy()
+            || crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| {
+                p.stages.iter().any(|stage| {
+                    let t = stage.translated();
+                    t.stores
+                        && (t.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES)
+                            || t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY))
+                })
+            });
+        if whole {
+            list.gather_close_prelude();
+        }
+        list.segments_dispatched();
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.dispatch_x(list, x, y, z, 0);
@@ -3346,7 +3368,7 @@ impl State {
         // It may write the arguments a window holds clamped.
         self.window = None;
         crate::indirect::end_window(list);
-        self.gather_ends(list, true);
+        self.dispatch_ends(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4583,7 +4605,11 @@ impl State {
         if !windowed && !joins {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
-            self.gather_ends(list, true);
+            if kind == DISPATCH {
+                self.dispatch_ends(list);
+            } else {
+                self.gather_ends(list, true);
+            }
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
@@ -4626,7 +4652,7 @@ impl State {
         };
         if joins {
             // The dispatch's record is taken (or clamped alone below): what the dispatch writes, from here on.
-            self.gather_ends(list, true);
+            self.dispatch_ends(list);
         }
         // With a lean clamp: the predicate word's and the spread records'
         // offsets in `bounded` (the plain records are at 0).

@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 127, "every pass, the wide loads too, without the fast-math flag");
+        assert_eq!(usual, 127 | super::bitcode::opt::FAST, "every pass, the wide loads and the fast-math flag too");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);

@@ -1649,6 +1649,10 @@ struct Segments {
     passes: u32,
     /// The passes of the segment open now that take records: none once something that may write arguments ends it.
     open: Vec<SegmentPass>,
+    /// A dispatch was recorded since the open segment began
+    /// (`crate::indirect::segments_across`): the next indirect draw, or the
+    /// title's next barrier, ends the segment.
+    dispatched: bool,
 }
 
 /// A pass of the open segment: its argument buffer (a host copy, its number), kind and stride, its number in the
@@ -2320,9 +2324,9 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them, unless
 /// `VICTORY_SCRATCH_SPARE_MB` says otherwise ([`spare_most`]).
-/// Kept at 128 MiB here (#1367 raised it to 512): the PC runs short of memory beside the title;
-/// VICTORY_SCRATCH_SPARE_MB raises it for a measured test.
-const SPARE_MOST: u64 = 128 << 20;
+/// 512 MiB (#1367): at 128 about 12 chunks of 4 MiB were freed and made
+/// again a frame; `VICTORY_SCRATCH_SPARE_MB` lowers it.
+const SPARE_MOST: u64 = 512 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -4229,7 +4233,8 @@ fn step_index() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_STEP_INDEX").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -4413,7 +4418,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // flights twice a frame, 50 ms of the submitting thread.)
         static RUNS: OnceLock<usize> = OnceLock::new();
         let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
+            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4096, |n| n.clamp(1, 1 << 16))
         });
         if settle_room() {
             runs_left = (runs_left * 8).min(1 << 16);
@@ -5066,7 +5071,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -7805,6 +7810,7 @@ impl HostList {
             }
             // The segments' slots likewise; the last segment ends here.
             gather.segments.open.clear();
+            gather.segments.dispatched = false;
             if gather.segments.used
                 && let Some(buffer) = &gather.segments.buffer
             {
@@ -7862,6 +7868,7 @@ impl HostList {
             segments.used = false;
             segments.passes = 0;
             segments.open.clear();
+            segments.dispatched = false;
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
@@ -8361,12 +8368,33 @@ impl HostList {
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         gather.closed = true;
         gather.segments.open.clear();
+        gather.segments.dispatched = false;
+    }
+
+    /// [`HostList::gather_close`] for a dispatch with
+    /// `crate::indirect::segments_across`: the prelude's gathering ends, the
+    /// open segment stays and is marked ([`HostList::segments_dispatched`]).
+    pub(crate) fn gather_close_prelude(&self) {
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
 
     /// What is about to be recorded may write arguments: the segment open now ends
     /// (`crate::indirect::gather_segments`), whatever the prelude's gathering does.
     pub(crate) fn segments_end(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).segments.open.clear();
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        gather.segments.open.clear();
+        gather.segments.dispatched = false;
+    }
+
+    /// A dispatch was recorded (`crate::indirect::segments_across`): what it
+    /// writes is seen by later commands only after a barrier of the title's
+    /// (D3D12's rule), so the open segment stays open until that barrier or
+    /// the next indirect draw, whichever comes first.
+    pub(crate) fn segments_dispatched(&self) {
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if !gather.segments.open.is_empty() {
+            gather.segments.dispatched = true;
+        }
     }
 
     /// Shaders of the list were declared to write the host copy numbered
@@ -8476,6 +8504,13 @@ impl HostList {
         };
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            // A draw after a dispatch the open segment outlived
+            // (`crate::indirect::segments_across`): that dispatch may have
+            // written its record, so the segment ends before it.
+            if gather.segments.dispatched && kind != crate::indirect::DISPATCH_KIND {
+                gather.segments.open.clear();
+                gather.segments.dispatched = false;
+            }
             let Segments { buffer, open, .. } = &mut gather.segments;
             if let Some(buffer) = buffer.as_ref()
                 && let Some(pass) = open
@@ -9193,12 +9228,13 @@ impl HostList {
                 _ => None,
             })
             .collect();
-        // Over 4 threads when there are several (each holds a read buffer of
-        // its own, so not more); a texture's own lock orders two reads of it.
+        // Over up to 8 threads when there are several (7 kept ones and this
+        // one; each holds a read buffer of its own); a texture's own lock
+        // orders two reads of it.
         if textures.len() <= 1 {
             return textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64;
         }
-        let per = textures.len().div_ceil(4);
+        let per = textures.len().div_ceil(8);
         if crate::shadow::kept_threads_now() {
             // On kept threads of their own (`crate::shadow::ahead_workers`):
             // their read buffers stay grown from one flush to the next.
@@ -9837,7 +9873,8 @@ fn fills_plain() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_FILLS_PLAIN").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,

@@ -65,10 +65,11 @@ pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one, [`WIDE`] (with
-/// the dead-dword masks of `narrow_raw_loads` and the view-end guard) too,
-/// but not [`FAST`] (runs 354/355: black blotches on skin and clothes with
-/// it, run 356 none without); `VICTORY_SHADER_OPT=63` drops the wide loads.
-pub const DEFAULT: u32 = ALL;
+/// the dead-dword masks of `narrow_raw_loads` and the view-end guard) and
+/// [`FAST`] too, the latter with `VICTORY_SHADER_FAST_BITS` 24 by default
+/// (no signed zeros, reciprocal: NaN and infinity tests kept; all flags gave
+/// black blotches in runs 354/355); `VICTORY_SHADER_OPT=127` drops FAST.
+pub const DEFAULT: u32 = ALL | FAST;
 /// Not a pass either: the 32-bit float binary operations are written with
 /// LLVM's unsafe-algebra fast-math flag, as an HLSL compiler writes them by
 /// default, so the driver may fuse a multiply and an add and turn a division

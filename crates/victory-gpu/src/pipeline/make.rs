@@ -446,13 +446,13 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8; 6 drained a cold
-/// library 35 % slower in run 353 on a 32 GB PC) on first use, at normal priority.
+/// Starts the workers (the logical processors less 4, 4 to 14: 6 drained a
+/// cold library 35 % slower than 8 in run 353) on first use, at normal priority.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(4).clamp(4, 14));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))

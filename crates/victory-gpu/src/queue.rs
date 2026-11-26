@@ -613,18 +613,18 @@ fn join_parts() -> bool {
     }
 }
 
-/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 4).
+/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 16).
 #[cfg(windows)]
 fn join_most() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(4))
+    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(16))
 }
 
-/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
+/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 128).
 #[cfg(windows)]
 fn join_lists() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_JOIN_LISTS").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(48))
+    *N.get_or_init(|| std::env::var("VICTORY_JOIN_LISTS").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(128))
 }
 
 /// With [`join_parts`]: parts taken off the queues' lines and not yet
