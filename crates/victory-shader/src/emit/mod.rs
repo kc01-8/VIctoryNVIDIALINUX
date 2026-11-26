@@ -226,7 +226,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & (bitcode::opt::ALL | bitcode::opt::FAST))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -913,7 +913,10 @@ mod tests {
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        let fast = super::bitcode::opt::FAST;
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all | fast);
+        assert_eq!(parse_shader_opt(Some("255")), all | fast);
+        assert_eq!(parse_shader_opt(Some("191")), usual | fast);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 

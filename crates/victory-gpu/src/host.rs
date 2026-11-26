@@ -2640,22 +2640,24 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 }
 "#;
 
-/// Whether [`CARD_COMPARE_WIDE`] is the compare (`VICTORY_CARD_HASH_WIDE=1`;
-/// off unless asked: it has not run in a game on this tree yet, and it is
-/// another hash with another rare pattern of changes it cannot see). Chosen
+/// Whether [`CARD_COMPARE_WIDE`] is the compare (the default;
+/// `VICTORY_CARD_HASH_WIDE=0` for a thread a piece: it is another hash with
+/// another rare pattern of changes it cannot see; run 349: card -10 ms). Chosen
 /// once and said in the log: stored and compared hashes must agree.
 pub(crate) fn card_hash_wide() -> bool {
     card_hash_mode() == 1
 }
 
-/// `VICTORY_CARD_HASH_WIDE`: 0 a thread a piece, 1 a group a piece, 2 in turn (`alt`, [`card_hash_wide_now`]).
+/// `VICTORY_CARD_HASH_WIDE`: 0 a thread a piece, 1 a group a piece (the default), 2 in turn (`alt`, [`card_hash_wide_now`]).
 fn card_hash_mode() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
     *MODE.get_or_init(|| {
+        // A group a piece unless asked otherwise: run 349 measured the
+        // card -10 ms a frame with it (CARD_HASH_WIDE=alt, warm caches).
         let mode = match std::env::var("VICTORY_CARD_HASH_WIDE").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("alt") => 2,
-            _ => 0,
+            _ => 1,
         };
         if mode == 1 {
             tracing::info!("the card's hashes of copies' pieces are made by a group of 64 threads a piece (VICTORY_CARD_HASH_WIDE=1)");

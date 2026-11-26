@@ -825,6 +825,7 @@ impl Module {
         }
         w.exit();
 
+        let fast = super::shader_opt() & opt::FAST != 0;
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
@@ -839,6 +840,11 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    // A 32-bit float result takes the unsafe-algebra flag
+                    // (bit 0 of the optional fourth field) with `opt::FAST`.
+                    Op::Bin(op, a, b) if fast && self.types[inst.ty.0 as usize] == TypeDef::Float => {
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, 1])
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
