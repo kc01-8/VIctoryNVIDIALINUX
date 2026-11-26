@@ -2316,7 +2316,9 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them, unless
 /// `VICTORY_SCRATCH_SPARE_MB` says otherwise ([`spare_most`]).
-const SPARE_MOST: u64 = 512 << 20;
+/// Kept at 128 MiB here (#1367 raised it to 512): the PC runs short of memory beside the title;
+/// VICTORY_SCRATCH_SPARE_MB raises it for a measured test.
+const SPARE_MOST: u64 = 128 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
