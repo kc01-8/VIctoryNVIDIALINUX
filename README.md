@@ -63,8 +63,8 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
   is read with zeros for them), #1352 (`VICTORY_SPREAD_LEAN`, off), #1312 (a dispatch waits for its
   compute pipeline: dark lamps after a fresh cache), and earlier today #1320, #1321, #1336, #1353.
 - **Translator:** raw loads ask only for the dwords that are read; `VICTORY_SHADER_OPT` bit 128 writes
-  the float operations with the fast-math flag (off: a test with it, the wide loads and
-  ray no-hit together put black blotches on skin and clothes; which of them is not known yet); a lane branch that only raises an LDS flag runs as two host waves (`VICTORY_LDS_FLAGS=0`
+  the float operations with the fast-math flag (off: it puts black blotches on skin and
+  clothes, two runs with it and none without; the driver may fold the title's NaN tests away); a lane branch that only raises an LDS flag runs as two host waves (`VICTORY_LDS_FLAGS=0`
   off).
 - **After a translator change keep `early-pipelines.txt`:** it holds keys only. Without it the first
   minutes in the world are black while about 1,000 pipelines are made.

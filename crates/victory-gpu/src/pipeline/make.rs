@@ -565,8 +565,10 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
+        // A compute pipeline is made at once when dispatches wait for theirs
+        // (#1312, the default; it has no shaders here, so nothing comes of
+        // it); either way it is noted for the next launch.
         assert!(ready(&p).is_none());
-        assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
 
