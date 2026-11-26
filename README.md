@@ -28,10 +28,11 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 11:50 UTC)
+## Status of this fork (2026-11-26, 23:15 UTC)
 
-**Playable, slowly: about 8 to 9.5 world frames per second at the first boat mission (the console runs
-30), 10 to 14 in lighter views. The tester has played from the opening through the prologue and past
+**Playable, slowly: about 7.5 to 8.5 world frames per second at the first boat mission at 3,300 to
+4,100 draws (the console runs 30), 10 to 14 in lighter views. The graphics card is the limit: about 80 ms
+of card time a frame. The tester has played from the opening through the prologue and past
 the first boat mission. The graphics card is still lost now and then 30 to 50 minutes into a session,
 before the title's next save point; cause not known yet. Shadowed areas are still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
@@ -45,11 +46,30 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | The prologue and the first missions | play: characters, textures, sky, sunlit exteriors, vehicles and boats; HUD, pause menu and pad input work. Played past the first boat mission (2026-11-25) |
 | Water | right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | **8.2 to 8.6 world frames a second at the first boat mission at 3,000 to 5,000 draws, 9.5 over a whole standing run** (runs 311, 312, 315, 316: frames counted only where every frame is a world frame, not fades or loading screens), with the texture pass on its own thread (`VICTORY_HEAP_WORKER=1`; 6.2 to 6.7 without it). 10 to 14 fps at 500 to 1,500 draws. The thread that prepares submissions is the limit (about 70 ms of a usual frame); the card is at work about 9 ms. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md`; the defaults are slower |
+| Frame rate in the world | **2026-11-26 evening: usual world frame 131 ms at 3,300 to 4,100 draws with the card at 80 ms a frame (card hashing a group of 64 threads a piece, now the default; 149 ms and 108 ms of card without it, run 349).** Earlier: 8.2 to 8.6 world frames a second at the first boat mission at 3,000 to 5,000 draws, 9.5 over a whole standing run** (runs 311, 312, 315, 316: frames counted only where every frame is a world frame, not fades or loading screens), with the texture pass on its own thread (`VICTORY_HEAP_WORKER=1`; 6.2 to 6.7 without it). 10 to 14 fps at 500 to 1,500 draws. The thread that prepares submissions is the limit (about 70 ms of a usual frame); the card is at work about 9 ms. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md`; the defaults are slower |
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 11:50 UTC)
+### Newest (2026-11-26, 23:15 UTC)
+
+- **Card hashing a group of 64 threads a piece is now the default (`VICTORY_CARD_HASH_WIDE=0` for the
+  old form):** the card's time a frame 80 ms against 108 ms at 3,300 to 4,100 draws, the usual world
+  frame 131 ms against 149 (two runs, different moments of the same mission: approximate).
+- **`VICTORY_TILES_SMALL_WHEN_FULL_MB` is 512 by default:** without it one run showed 612 textures black.
+- **Merged pull requests:** #1366 (failed fence waits are reported instead of passing as done), #1376
+  (texture read-backs re-registered after the title reuses their memory), #1380 (`clzero` on a guarded
+  line goes through the guard), #1367 (scratch chunks reused at any size; the spare cap is kept at 128
+  MiB here, `VICTORY_SCRATCH_SPARE_MB` raises it), #1392 (a never-filled texture with missing pages
+  is read with zeros for them), #1352 (`VICTORY_SPREAD_LEAN`, off), #1312 (a dispatch waits for its
+  compute pipeline: dark lamps after a fresh cache), and earlier today #1320, #1321, #1336, #1353.
+- **Translator:** raw loads ask only for the dwords that are read; `VICTORY_SHADER_OPT` bit 128 writes
+  the float operations with the fast-math flag (off: a test with it, the wide loads and
+  ray no-hit together put black blotches on skin and clothes; which of them is not known yet); a lane branch that only raises an LDS flag runs as two host waves (`VICTORY_LDS_FLAGS=0`
+  off).
+- **After a translator change keep `early-pipelines.txt`:** it holds keys only. Without it the first
+  minutes in the world are black while about 1,000 pipelines are made.
+
+### Earlier (2026-11-26, 11:50 UTC)
 
 - **Measured twice: a submission's texture checks side by side on the helper threads
   (`VICTORY_PARALLEL_REFRESH=1`):** 8.7 and 9.4 ms less of the preparing thread's work a frame at equal
