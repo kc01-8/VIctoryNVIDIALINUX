@@ -2566,27 +2566,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-/// [`MASKED_PATCH`] compiled (as the compare is, `cs_5_1`).
-fn masked_patch_code() -> windows::core::Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    let mut code = None;
-    // SAFETY: the source and names live through the call; the out pointer is ours.
-    unsafe {
-        D3DCompile(
-            MASKED_PATCH.as_ptr().cast(),
-            MASKED_PATCH.len(),
-            windows::core::s!("masked patch"),
-            None,
-            None,
-            windows::core::s!("main"),
-            windows::core::s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            None,
-        )?;
-    }
-    code.ok_or_else(windows::core::Error::empty)
+/// [`MASKED_PATCH`] compiled (as the compare is; see [`crate::hlsl`]).
+fn masked_patch_code() -> windows::core::Result<Vec<u8>> {
+    crate::hlsl::compile_compute("masked patch", MASKED_PATCH)
 }
 
 pub(crate) const CARD_COMPARE: &str = r#"
@@ -5521,28 +5503,7 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            let source = card_compare_source();
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let code = crate::hlsl::compile_compute("card compare", card_compare_source())?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -5552,7 +5513,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = code.as_slice();
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -5570,7 +5531,7 @@ impl Host {
             let patch_pso = (crate::shadow::masked_patch_mode() != 0)
                 .then(|| {
                     let made = masked_patch_code().and_then(|code| {
-                        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                        let bytes = code.as_slice();
                         self.device.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                             pRootSignature: std::mem::transmute_copy(&root),
                             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
@@ -5613,30 +5574,11 @@ impl Host {
     /// [`CARD_COMPARE_WIDE`]'s pipeline with the compare's root signature `root` (the two shaders declare the same
     /// one), for `VICTORY_CARD_HASH_WIDE=alt`; `None`, said in the log, if it cannot be made.
     fn make_card_compare_wide(&self, root: &ID3D12RootSignature) -> Option<ID3D12PipelineState> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<ID3D12PipelineState> {
-            let mut code: Option<ID3DBlob> = None;
-            // SAFETY: the source and names live through the call; the out pointer is ours.
-            unsafe {
-                D3DCompile(
-                    CARD_COMPARE_WIDE.as_ptr().cast(),
-                    CARD_COMPARE_WIDE.len(),
-                    windows::core::s!("card compare wide"),
-                    None,
-                    None,
-                    windows::core::s!("main"),
-                    windows::core::s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut code,
-                    None,
-                )?;
-            }
-            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let code = crate::hlsl::compile_compute("card compare wide", CARD_COMPARE_WIDE)?;
             // SAFETY: the blob's own bytes; a root signature the shader declares as well.
             unsafe {
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let bytes = code.as_slice();
                 self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(root),
                     CS: D3D12_SHADER_BYTECODE {
@@ -5659,28 +5601,8 @@ impl Host {
     /// [`CardInflight`] for `results` bytes of the compare's results; `None`
     /// (and the old fetch) if the shader or the memory cannot be had.
     fn make_card_inflight(&self, results: u64) -> Option<CardInflight> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<CardInflight> {
-            let mut code: Option<ID3DBlob> = None;
-            // SAFETY: the source and names live through the call; the out
-            // pointer is ours.
-            unsafe {
-                D3DCompile(
-                    CARD_FETCH.as_ptr().cast(),
-                    CARD_FETCH.len(),
-                    windows::core::s!("card fetch in flight"),
-                    None,
-                    None,
-                    windows::core::s!("main"),
-                    windows::core::s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut code,
-                    None,
-                )?;
-            }
-            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let code = crate::hlsl::compile_compute("card fetch in flight", CARD_FETCH)?;
             let slots = inflight_slots(inflight_fetch_bytes());
             let (table, table_data) = self.shared_buffer(4 + results).ok_or_else(windows::core::Error::empty)?;
             name(&table, || "card fetch in flight: tickets".into());
@@ -5693,7 +5615,7 @@ impl Host {
             // SAFETY: the blob's own bytes; the root signature is inside
             // the shader.
             unsafe {
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let bytes = code.as_slice();
                 let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
                 let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),
@@ -12104,8 +12026,6 @@ mod masked_patch_compile_tests {
     #[test]
     fn the_masked_patch_compiles() {
         let code = super::masked_patch_code().expect("MASKED_PATCH compiles");
-        // SAFETY: the blob's own bytes.
-        let size = unsafe { code.GetBufferSize() };
-        assert!(size > 100);
+        assert!(code.len() > 100);
     }
 }
