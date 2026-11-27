@@ -1568,16 +1568,37 @@ void main() {
     }
 
     impl WarpHarness {
+        /// The harness on the software adapter, or `None` (and the test
+        /// passes without running) where there is none. With
+        /// `VICTORY_TEST_ADAPTER=hardware` it is made on the first hardware
+        /// adapter instead (under Proton: the card, through vkd3d-proton,
+        /// which has no software adapter), and a harness that cannot be
+        /// made fails the test.
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            let hardware = std::env::var("VICTORY_TEST_ADAPTER").is_ok_and(|v| v == "hardware");
+            let made = Self::make(hardware);
+            if hardware {
+                Some(made.expect("VICTORY_TEST_ADAPTER=hardware: no harness on the hardware adapter"))
+            } else {
+                made
+            }
+        }
+
+        fn make(hardware: bool) -> Option<Self> {
+            // SAFETY: plain DXGI adapter queries and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    return None;
-                }
+                let adapter: IDXGIAdapter = if hardware {
+                    factory.EnumAdapters(0).ok()?
+                } else {
+                    let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                    let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+                    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                        return None;
+                    }
+                    adapter
+                };
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
@@ -1730,28 +1751,13 @@ void main() {
         }
     }
 
+    /// `source` compiled as the runtime compiles its helpers
+    /// ([`crate::hlsl::compile_compute`]), with its own root signature.
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
+        let code = crate::hlsl::compile_compute("worker", source)?;
+        // SAFETY: our own code, the root signature inside it.
         unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
+            let bytes = code.as_slice();
             let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -1762,6 +1768,61 @@ void main() {
                 ..Default::default()
             })?;
             Ok(Clamp { root, pso })
+        }
+    }
+
+    /// The masked patch run on the card stores, per word (offset, mask,
+    /// value), the value's bytes under the mask and keeps the others:
+    /// `(old & !mask) | (value & mask)` in every dword it names, nothing
+    /// in the dwords it does not, from word `first` on.
+    #[test]
+    fn warp_masked_patch_stores_only_the_masked_bytes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let patch = compile_cs(&warp.device, crate::host::MASKED_PATCH)
+            .expect("the masked patch must compile");
+        const DWORDS: usize = 4096;
+        const SKIPPED: usize = 3; // words before `first`, never applied
+        let old: Vec<u32> = (0..DWORDS as u32).map(|i| i.wrapping_mul(0x9e37_79b9) ^ 0x5a5a_0f0f).collect();
+        // Every third dword, with masks of every shape bytes can make.
+        let masks = [0xffff_ffffu32, 0x0000_00ff, 0xff00_0000, 0x00ff_ff00, 0xff00_00ff, 0x0000_ff00];
+        let words: Vec<[u32; 3]> = (0..DWORDS / 3)
+            .map(|k| {
+                let at = (k * 3) as u32;
+                [at * 4, masks[k % masks.len()], at.wrapping_mul(0x0101_0101) ^ 0xdead_beef]
+            })
+            .collect();
+        let (_copy, copy_ptr, copy_gpu) = warp.shared_buffer((DWORDS * 4) as u64);
+        let (_words, words_ptr, words_gpu) = warp.shared_buffer((words.len() * 12) as u64);
+        let (_unused, _, unused_gpu) = warp.shared_buffer(256);
+        // SAFETY: the mappings hold `DWORDS` dwords and every word's 12 bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(old.as_ptr(), copy_ptr.cast::<u32>(), DWORDS);
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u32>(), words_ptr.cast::<u32>(), words.len() * 3);
+        }
+        let count = (words.len() - SKIPPED) as u32;
+        // SAFETY: our open list, live buffers, the patch's own root signature.
+        unsafe {
+            warp.list.SetComputeRootSignature(&patch.root);
+            warp.list.SetPipelineState(&patch.pso);
+            let constants = [count, SKIPPED as u32, 0, 0, 0, 0];
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, words_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, copy_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, unused_gpu);
+            warp.list.Dispatch(count.div_ceil(64), 1, 1);
+        }
+        warp.submit_and_wait();
+        let mut want = old.clone();
+        for w in &words[SKIPPED..] {
+            let i = w[0] as usize / 4;
+            want[i] = (want[i] & !w[1]) | (w[2] & w[1]);
+        }
+        // SAFETY: the mapping holds `DWORDS` dwords.
+        let got: Vec<u32> = (0..DWORDS).map(|i| unsafe { copy_ptr.cast::<u32>().add(i).read_volatile() }).collect();
+        for i in 0..DWORDS {
+            assert_eq!(got[i], want[i], "dword {i}: {:#010x} instead of {:#010x}", got[i], want[i]);
         }
     }
 
@@ -2225,7 +2286,7 @@ void main(uint3 gid : SV_GroupID) {
     out_buf.InterlockedAdd(4, 1u, was);
 }
 "#;
-        let cs = crate::host::compile(SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        let cs = crate::hlsl::compile_compute("spread", SHADER).unwrap();
         // SAFETY: WARP device and open command list in `WarpHarness`.
         let (root, pso, plain_sig, spread_sig) = unsafe {
             let root: ID3D12RootSignature = warp.device.CreateRootSignature(0, &cs[..]).unwrap();
