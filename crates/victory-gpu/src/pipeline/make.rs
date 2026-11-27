@@ -116,6 +116,13 @@ impl Pending {
         self.make_with(|| {
             if let Some(hash) = denied(&self.shaders) {
                 tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
+                // Still translated (no driver compile), so `VICTORY_SHADER_SAVE`
+                // keeps what the driver was refused, for a test outside the title.
+                if std::env::var_os("VICTORY_SHADER_SAVE").is_some() {
+                    for shader in &self.shaders {
+                        let _ = shader.translated();
+                    }
+                }
                 return None;
             }
             HostPipeline::new(&self.shaders, self.graphics.as_deref())
