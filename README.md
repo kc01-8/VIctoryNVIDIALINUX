@@ -19,7 +19,7 @@ the game's developer or publisher, or by Microsoft.
 | Cross-building `victory.exe` on Linux | ✅ works |
 | Launcher, smoke and loader tests under Proton (no game files) | ✅ pass |
 | The GPU helper shaders under Proton (indirect draws, masked patch, card compare, card fetch) | ✅ compiled with DXC, because Wine's own compiler refuses them; their tests pass on an RTX 3080 Ti |
-| Running a title under Proton | ⚠️ boots, loads and draws the first scenes (thousands of draws a frame, 0.2–1 fps), and ends after 7–10 minutes: at an 18 GB cap, or (run 26, 16.2 GB) when the title stops itself. Needs Proton Experimental **and vkd3d-proton built from master** (below): the vkd3d-proton in current Proton releases crashes on some of the title's shaders |
+| Running a title under Proton | ⚠️ boots, loads and draws the first scenes (thousands of draws a frame, 0.2–1 fps), and ends after 7–10 minutes at an 18 GB cap. On NVIDIA's 620 drivers a run can freeze the desktop (below). Needs Proton Experimental **and vkd3d-proton built from master** (below): the vkd3d-proton in current Proton releases crashes on some of the title's shaders |
 | Performance measurements on Linux | none yet |
 
 The details, with the commands that produced them, are in
@@ -69,13 +69,19 @@ as the work moves on.
   GB, because victory keeps copies of title memory in the PC's memory for
   the GPU, and NVIDIA's Linux driver pins every page of those buffers
   when they are made (Windows pages out what nothing touches). This is
-  being cut down (see the status doc). `VICTORY_WINDOW_KB=512
-  VICTORY_WINDOW_TAILS=1` makes those copies smaller (run 26 peaked at
-  16.2 GB). The first build of the title's pipelines also takes several
-  GB at once: `VICTORY_PIPELINE_WORKERS=4` builds fewer at a time.
-- **If a run is killed while NVIDIA's driver is logging mapping errors**
-  (`NVRM: intermapRegisterDmaMapping` in `journalctl -k`), the driver can
-  stay stuck (`nvidia-smi` hangs) until the PC is restarted.
+  being cut down (see the status doc). The first build of the title's
+  pipelines also takes several GB at once: `VICTORY_PIPELINE_WORKERS=4`
+  builds fewer at a time.
+- **NVIDIA's 620 drivers can freeze the desktop.** After the driver logs
+  `NVRM: intermapRegisterDmaMapping: Failed to insert new mapping node`
+  (`journalctl -k`), its table of mappings is broken, and when the
+  process exits the driver can loop holding its lock: the screen
+  freezes and only a restart helps
+  ([NVIDIA/open-gpu-kernel-modules#1540](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1540),
+  fix in [#1542](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1542),
+  not merged yet). Other Proton games hit it too; low memory and many
+  buffers made and freed make it likelier. 615.x drivers did not freeze
+  on it.
 - **DXC**, Microsoft's open-source shader compiler: `dxcompiler.dll` and
   `dxil.dll` from `bin/x64` of a
   [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases).

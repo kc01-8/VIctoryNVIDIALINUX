@@ -100,7 +100,7 @@ most runs from 22 on (run 26, below).
 | 23 | as 22, `VICTORY_PIPELINE_WORKERS=4`, the library from run 22 | in the 3D scenes 2m25s in and still drawing (0.2–0.5 fps, peak 15.9 GB) when `kc-run.sh`'s own watchdog killed it at 5 min: it watched `run.log`, which stops growing once the log goes to `victory.log` (fixed) |
 | 24 | as 23, the watchdog fixed | every known pipeline made 1m20s in, before the load; in the 3D scenes from 2 min at 0.1–0.8 fps, at the 18 GB cap from about 2m20s; killed by the kernel at the cap 9m30s in (below) |
 | 25 | as 24, `VICTORY_INPLACE=1 VICTORY_INPLACE_PROBE=1` | killed by the kernel at the cap 7m10s in; 80 windows (380 MB) in place, the rest could not be (below) |
-| 26 | as 25 without the probe, `VICTORY_WINDOW_KB=512 VICTORY_WINDOW_TAILS=1` | peak 16.2 GB, under the cap; the title stopped itself 9m44s in (two of its object pools full), after a rising count of NVIDIA driver errors; when the run was killed the driver stayed stuck (below) |
+| 26 | as 25 without the probe, `VICTORY_WINDOW_KB=512 VICTORY_WINDOW_TAILS=1` | peak 16.2 GB, under the cap; froze the desktop 9m44s in: NVIDIA's driver looped holding its global lock while the title's process exited, after many failed GPU mappings (a 620.x driver bug, below); needed a reboot |
 
 **The driver crash, reproduced outside the title.** The saved shaders
 (`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
@@ -248,11 +248,13 @@ a run's 18 GB is GPU data that victory keeps in the PC's memory:
   write through it is refused (in-place windows only read).
 - **In place alone is not enough.** Run 25 had 80 windows (380 MB) in
   place and reached the cap at about the same time as run 24.
-- **A finer grid helps.** Run 26 cut windows on a 512 KiB grid, with an
-  ask without a length taking its cell's tail (`VICTORY_WINDOW_KB=512
-  VICTORY_WINDOW_TAILS=1`, hyphennn's switches, off by default). Windows
-  held 2.7–3.3 GB, and the run peaked at 16.2 GB, under the cap for the
-  first time since run 22.
+- **A finer grid saves memory but churns.** Run 26 cut windows on a
+  512 KiB grid, with an ask without a length taking its cell's tail
+  (`VICTORY_WINDOW_KB=512 VICTORY_WINDOW_TAILS=1`, hyphennn's switches,
+  off by default). Windows held 2.7–3.3 GB, and the run peaked at 16.2
+  GB, under the cap for the first time since run 22. But it made windows
+  about four times as often, which the 620 driver's bug feeds on (below):
+  not recommended.
 - **Next: windows over the page pool in place.** The pool is a committed
   section under Wine. Victory can map the pool pages a window covers,
   in order, into a range of its own (a page of zeros where the title
@@ -260,24 +262,46 @@ a run's 18 GB is GPU data that victory keeps in the PC's memory:
   a range, but vkd3d-proton passes it to the driver. Written
   (`VICTORY_INPLACE_VIEWS=1`, with a probe case of its own), not run yet.
 
-**Run 26 ended in the title and the driver.** Frames slowed from about
-0.6 s to 3.5–5 s in its last minutes, nearly all of it in submit calls.
-Then the title stopped itself (a break in seven of its threads). Its
-crash report shows two of its object pools full (45,000 of 45,000 and
-22,334 of 22,500 entries); in its 13 earlier reports, from runs that
-ended within 3 minutes, both were under half full. Its streaming of the
-opening scene had still not finished after nearly 10 minutes.
+**Run 26 froze the desktop: a bug in NVIDIA's 620 driver.** Frames slowed
+from about 0.6 s to 3.5–5 s in its last minutes, nearly all of it in
+submit calls. At 9m44s the screen froze. The title's process was exiting
+(a break in seven of its threads), and its main thread was looping inside
+NVIDIA's kernel driver while it closed the device (`nvidia_close` →
+`intermapDelDmaMapping` → `btreeUnlink`). It held the driver's global
+lock, so the compositor and `nvidia-smi` waited on it (the kernel's
+hung-task report). Processes stuck in the driver can't be killed; only a
+reboot cleared it.
 
-From 2 minutes in, NVIDIA's kernel driver logged mapping errors
-("intermapRegisterDmaMapping: Failed to insert new mapping node",
-assertions in `gpu_vaspace.c`, "can't update VA space for mapping"): 32
-in one minute, 229 in its last two minutes before the title stopped.
-The same errors appear in runs 22, 24 and 25, a few at a time, so
-in-place windows did not bring them. When `kc-run.sh`'s watchdog
-killed the stuck run, two of its processes were left in the driver's
-close path (`nvkms_close`, `drm_release`), and `nvidia-smi` waits on the
-driver's lock. These processes can't be killed, so only a reboot clears
-the driver. What makes these mappings fail is not known yet.
+- **The bug.** In the 620 drivers (here `nvidia-open-dkms` 620.73.04),
+  when a new GPU mapping fails to go in because it overlaps one that is
+  there ("intermapRegisterDmaMapping: Failed to insert new mapping
+  node"), the error path takes a memory object that still has mappings
+  out of the driver's table. When that object's last mapping goes, often
+  as the process exits, the driver walks a broken table: it loops forever
+  holding its lock, or faults. This is
+  [NVIDIA/open-gpu-kernel-modules#1540](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1540),
+  with a fix in
+  [#1542](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1542)
+  (not merged). In 615.x the same failures did no harm. Proton games of
+  all kinds hit it. This PC stays on 620.73.04 for now.
+- **The failures.** From 2 minutes in, the driver logged them with
+  `gpu_vaspace.c` assertions and "can't update VA space for mapping": 32
+  in one minute, 229 in the two minutes before the freeze. Runs 22, 24
+  and 25 had a few each, near their memory peaks; run 22 had them
+  without in-place windows, so these did not bring them.
+- **What makes them likelier here.** Making and freeing many buffers,
+  and running short of memory. An issue on hyphennn's fork
+  ([#1340](https://github.com/fxceless/victory-fork/issues/1340)) found
+  the same, with read-back buffers. Run 26's finer grid and tails made
+  14,894 shared buffers (mostly windows) in 10 minutes, against 6,218 in
+  run 24's 9m30s: about 14 a second against 3 during play. Its error
+  bursts were the worst.
+- **The title's crash report** shows two of its object pools full (45,000
+  of 45,000 and 22,334 of 22,500 entries); its 13 earlier reports, from
+  runs that ended within 3 minutes, had both under half full. Its
+  streaming of the opening scene had still not finished. With frames of
+  3–5 s and the GPU stalling, this may follow from the stall rather than
+  cause it.
 
 **First performance notes (run 24, all pipelines made).** A frame took
 about 1 s, and the card was idle for 0.9 s of it; the time goes to the CPU
