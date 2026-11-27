@@ -167,7 +167,7 @@ pub(crate) struct Placed {
 /// shortcut: a descriptor slot written before a window was let go still
 /// shows the old one (the memory line counts slots that showed another
 /// copy than the one brought up to date).
-fn views_on() -> bool {
+pub(crate) fn views_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
 }
