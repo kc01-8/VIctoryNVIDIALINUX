@@ -96,6 +96,16 @@ as the work moves on.
   Put both in one folder and set `VICTORY_DXC` to that folder. Wine's own
   HLSL compiler refuses several shaders the GPU code compiles at runtime.
   Without DXC, indirect draws are dropped.
+- **The BCPack tables, which you must source yourself.** The title's
+  streamed textures are packed with BCPack, and decoding needs the
+  format's constant tables. They are not this project's work and its
+  licence does not cover them, so this repository does not carry them (not
+  in its history either). Get them from material you are entitled to use,
+  as one file, `bcpack-tables.bin` (77,982 bytes, SHA-256 `1f1d4760…c36b`,
+  in full in [docs/asset-policy.md](docs/asset-policy.md)), and put it
+  beside `victory.exe` or set `VICTORY_BCPACK_TABLES` to it (a Linux path
+  is turned into a Wine one by the launcher). Without it those textures
+  stay empty.
 - Your own dump of the title, outside this repository.
 - A Windows build of `victory.exe` (build it on Linux, below).
 

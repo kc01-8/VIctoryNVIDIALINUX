@@ -47,5 +47,12 @@ KC_DXC_DIR="${KC_DXC_DIR:-$HOME/.local/opt/dxc}"
 export KC_DXC_DIR
 export VICTORY_DXC="Z:$(printf '%s' "$KC_DXC_DIR" | tr '/' '\\')"
 
+# The BCPack tables, which you supply yourself (docs/asset-policy.md): kept
+# outside the checkout. A Wine Z: path, as for DXC.
+KC_BCPACK_TABLES="${KC_BCPACK_TABLES:-$HOME/.local/share/victory/bcpack-tables.bin}"
+if [ -f "$KC_BCPACK_TABLES" ]; then
+    export VICTORY_BCPACK_TABLES="Z:$(printf '%s' "$KC_BCPACK_TABLES" | tr '/' '\\')"
+fi
+
 [ -f "$_kc_root/local.env" ] && . "$_kc_root/local.env"
 unset _kc_root _kc_cache

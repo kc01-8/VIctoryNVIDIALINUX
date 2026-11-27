@@ -62,6 +62,10 @@ fi
 mkdir -p -- "$DXVK_STATE_CACHE_PATH"
 # DXC for the helper shaders Wine's compiler refuses (docs/kc-linux-status.md):
 # a Linux path to dxcompiler.dll or its folder is handed over on Z:.
+if [[ ${VICTORY_BCPACK_TABLES:-} == /* ]]; then
+    tables=$(realpath -m -- "$VICTORY_BCPACK_TABLES")
+    export VICTORY_BCPACK_TABLES="Z:${tables//\//\\}"
+fi
 if [[ ${VICTORY_DXC:-} == /* ]]; then
     dxc=$(realpath -m -- "$VICTORY_DXC")
     export VICTORY_DXC="Z:${dxc//\//\\}"
