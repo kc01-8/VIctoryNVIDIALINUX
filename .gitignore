@@ -76,3 +76,8 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Maintainer-local files (never committed)
+/private.md
+/CLAUDE.local.md
+/local.env
