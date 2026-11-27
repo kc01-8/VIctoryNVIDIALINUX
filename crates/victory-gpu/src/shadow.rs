@@ -3152,9 +3152,6 @@ impl Shadow {
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
-        if window {
-            IN_PLACE_LONGEST.fetch_max(len, Ordering::Relaxed);
-        }
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, placed.cpu as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
@@ -5113,9 +5110,64 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
         .map(|(k, e)| (k.0, e.end - k.0))
 }
 
-/// The longest window outside buffers put in place so far, in bytes: how
-/// far below a range [`in_place_let_go`] looks for windows that reach it.
-static IN_PLACE_LONGEST: AtomicU64 = AtomicU64::new(0);
+/// Windows outside buffers in place, by the 64 KiB pages they cover: the
+/// ones a change of those pages must look at ([`in_place_let_go`],
+/// [`own_views_mapped`]). Looking through `LOOSE` instead for every window
+/// that could reach a remapped page took 1.5-3.4 s a frame of the
+/// runtime's remapping in runs 28 and 31 (135-207 ms in run 24), with the
+/// lock held that texture refreshes wait for. A key may outlive its window
+/// here (the idle sweep lets windows go): it is dropped when a look finds
+/// the window gone. Taken after `LOOSE`.
+static IN_PLACE_PAGES: Mutex<BTreeMap<u64, Vec<(u64, u64)>>> = Mutex::new(BTreeMap::new());
+
+fn page_range(start: u64, end: u64) -> std::ops::Range<u64> {
+    start >> 16..end.div_ceil(1 << 16)
+}
+
+/// Window `key` (start, bytes) is in place: noted on its pages.
+fn index_in_place(key: (u64, u64)) {
+    let mut pages = IN_PLACE_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    for page in page_range(key.0, key.0 + key.1) {
+        let keys = pages.entry(page).or_default();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+}
+
+/// Window `key` is no longer in place there.
+fn unindex_in_place(key: (u64, u64)) {
+    let mut pages = IN_PLACE_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    for page in page_range(key.0, key.0 + key.1) {
+        if let Some(keys) = pages.get_mut(&page) {
+            keys.retain(|k| *k != key);
+            if keys.is_empty() {
+                pages.remove(&page);
+            }
+        }
+    }
+}
+
+/// The windows in place that cover a page of `[at, end)`, each once; those
+/// `map` no longer holds in place are dropped from the index.
+fn in_place_over(map: &BTreeMap<(u64, u64), Arc<Shadow>>, at: u64, end: u64) -> Vec<(u64, u64)> {
+    let mut keys: Vec<(u64, u64)> = Vec::new();
+    {
+        let pages = IN_PLACE_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, here) in pages.range(page_range(at, end)) {
+            for key in here {
+                if !keys.contains(key) {
+                    keys.push(*key);
+                }
+            }
+        }
+    }
+    let (live, gone): (Vec<_>, Vec<_>) = keys.into_iter().partition(|key| map.get(key).is_some_and(|s| s.place.is_some()));
+    for key in gone {
+        unindex_in_place(key);
+    }
+    live
+}
 
 /// Copies in place taken out of the tables so far ([`Shadow::let_go`]).
 static IN_PLACE_GONE: AtomicU64 = AtomicU64::new(0);
@@ -5146,16 +5198,15 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        // Every window in place that reaches `at` begins no lower than the
-        // longest such window below it.
-        let reach = IN_PLACE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(reach), 0)..(end, 0))
+        let keys: Vec<(u64, u64)> = in_place_over(&map, at, end)
+            .into_iter()
             // Windows over the pool through views of our own go only when
             // the title maps other pages there (`own_views_mapped`).
-            .filter(|(key, shadow)| shadow.place.is_some() && shadow.views.is_none() && key.0 + key.1 > at)
-            .map(|(key, _)| *key)
+            .filter(|key| map.get(key).is_some_and(|shadow| shadow.views.is_none()))
             .collect();
+        for key in &keys {
+            unindex_in_place(*key);
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -5188,12 +5239,11 @@ pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -
     let (mut kept, mut marked) = (0, 0);
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        let reach = IN_PLACE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
         let mut keys = Vec::new();
-        for (key, shadow) in map.range((at.saturating_sub(reach), 0)..(end, 0)) {
-            let Some(views) = shadow.views.as_ref() else { continue };
+        for key in in_place_over(&map, at, end) {
+            let Some(views) = map.get(&key).and_then(|shadow| shadow.views.as_ref()) else { continue };
             match views.shows(at, len, section, offset) {
-                Some(false) if views.was_read(at, end) => keys.push(*key),
+                Some(false) if views.was_read(at, end) => keys.push(key),
                 Some(false) => {
                     views.mark_changed(at, end);
                     marked += 1;
@@ -5201,6 +5251,9 @@ pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -
                 Some(true) => kept += 1,
                 None => {}
             }
+        }
+        for key in &keys {
+            unindex_in_place(*key);
         }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
@@ -5656,6 +5709,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if map.get(&(start, len)).is_some_and(|shadow| stale(shadow))
         && let Some(shadow) = map.remove(&(start, len))
     {
+        unindex_in_place((start, len));
         crate::inplace::own_views_let_go_at_ask();
         mark_gone(std::slice::from_ref(&shadow));
         crate::host::retire(shadow);
@@ -5670,6 +5724,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        index_in_place((start, len));
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
