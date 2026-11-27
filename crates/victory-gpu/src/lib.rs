@@ -33,6 +33,8 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 mod hold;
+#[cfg(all(test, windows))]
+mod hlsl_probe;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

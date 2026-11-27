@@ -23,7 +23,8 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
-const SOURCE: &str = r#"
+/// The argument clamp, compiled at runtime (also by `hlsl_probe`).
+pub(crate) const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
 // The title's records, read only; the clamped ones go to the list's own.

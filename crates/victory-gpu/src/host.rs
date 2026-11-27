@@ -2790,9 +2790,8 @@ struct Compositor {
     srv_stride: u32,
 }
 
-impl Compositor {
-    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
-        const SOURCE: &str = r#"
+/// The present compositor's shaders, compiled at runtime (also by `hlsl_probe`).
+pub(crate) const COMPOSITE_SOURCE: &str = r#"
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
             void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
@@ -2803,6 +2802,10 @@ impl Compositor {
                 return tex.Sample(smp, uv);
             }
         "#;
+
+impl Compositor {
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        const SOURCE: &str = COMPOSITE_SOURCE;
         let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
             let mut code: Option<ID3DBlob> = None;
             let mut errors: Option<ID3DBlob> = None;

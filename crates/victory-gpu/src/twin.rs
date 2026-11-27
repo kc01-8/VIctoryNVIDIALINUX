@@ -485,7 +485,7 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// plane and back, in the scratch buffer: `u` becomes `u` times
 /// `0x37800080` (the title's 1/65535; its tiled-lighting draws rasterise
 /// that very float and test it EQUAL), and a float back the nearest `u`.
-const SOURCE: &str = r#"
+pub(crate) const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
 RWByteAddressBuffer buf : register(u0);
