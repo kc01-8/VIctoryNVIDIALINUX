@@ -16,6 +16,14 @@ one setup: **an NVIDIA GeForce card on x86-64 Linux, under Proton**.
 You need your own copy of the game. It is not affiliated with or endorsed by
 the game's developer or publisher, or by Microsoft.
 
+**The BCPack tables are not in this repository and must be sourced by the
+user.** Decoding the title's BCPack-packed textures needs the format's
+constant tables, which are not this project's work and which its licence
+does not cover; they were removed from this repository and its whole
+history. Supply them yourself as `bcpack-tables.bin` (see
+`docs/asset-policy.md` on `kc/nvidia` for its size and SHA-256 and where it
+goes).
+
 ## Branches
 
 The work is not on this branch. How to build and run under Proton, and where

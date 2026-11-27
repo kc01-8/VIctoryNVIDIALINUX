@@ -9,8 +9,9 @@
 //! back references (to one of the last 256 blocks, or to a per-format
 //! dictionary that stands in for blocks -1 to -255) and the residuals of the
 //! endpoints and indices against them. The models, the index rank tables,
-//! the BC7 control codes and the dictionaries are constants of the format,
-//! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]).
+//! the BC7 control codes and the dictionaries are constants of the format.
+//! They are not part of this repository: the user supplies them as a file
+//! ([`Tables::supplied`], docs/asset-policy.md).
 
 use std::fmt;
 
@@ -118,10 +119,35 @@ impl Reader<'_> {
     }
 }
 
+/// The environment variable that names the tables file the user supplies
+/// (the file, or a folder that holds [`TABLES_FILE`]).
+pub const TABLES_ENV: &str = "VICTORY_BCPACK_TABLES";
+
+/// The tables file's name, looked for beside the executable.
+pub const TABLES_FILE: &str = "bcpack-tables.bin";
+
+/// Where [`Tables::supplied`] reads the tables: the file
+/// [`TABLES_ENV`] names (or [`TABLES_FILE`] in the folder it names), else
+/// [`TABLES_FILE`] beside the executable; `None` if there is no such file.
+pub fn supplied_path() -> Option<std::path::PathBuf> {
+    if let Some(named) = std::env::var_os(TABLES_ENV).map(std::path::PathBuf::from) {
+        let file = if named.is_dir() { named.join(TABLES_FILE) } else { named };
+        return file.is_file().then_some(file);
+    }
+    let beside = std::env::current_exe().ok()?.parent()?.join(TABLES_FILE);
+    beside.is_file().then_some(beside)
+}
+
 impl Tables {
-    /// The tables VIctory ships with.
-    pub fn builtin() -> Result<Tables, Error> {
-        Tables::parse(include_bytes!("bcpack-tables.bin"))
+    /// The tables from the file the user supplies ([`supplied_path`]). They
+    /// are constants of the format, not this project's work, and are not
+    /// in this repository; without them no BCPack stream can be decoded.
+    pub fn supplied() -> Result<Tables, Error> {
+        let path = supplied_path().ok_or(Error(
+            "no tables: supply bcpack-tables.bin beside victory.exe, or name it with VICTORY_BCPACK_TABLES",
+        ))?;
+        let bytes = std::fs::read(path).map_err(|_| Error("the tables file could not be read"))?;
+        Tables::parse(&bytes)
     }
 
     /// Reads the table file: 128 x 9 u16 model frequencies (per bucket, the
@@ -1160,9 +1186,13 @@ fn bc6<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// Tables the user supplies parse (with none supplied there is nothing
+    /// to check: they are not in this repository).
     #[test]
-    fn the_shipped_tables_parse() {
-        assert!(super::Tables::builtin().is_ok());
+    fn supplied_tables_parse() {
+        if super::supplied_path().is_some() {
+            assert!(super::Tables::supplied().is_ok());
+        }
     }
 
     use super::*;
@@ -1421,11 +1451,8 @@ mod tests {
                 narrow[(m * BUCKETS + b) * 2..][..2].copy_from_slice(&(f as u16).to_le_bytes());
             }
         }
-        for t in [
-            Tables::builtin().unwrap(),
-            Tables::parse(&tables()).unwrap(),
-            Tables::parse(&narrow).unwrap(),
-        ] {
+        // (With the user's tables too, if supplied.)
+        for t in [Tables::parse(&tables()).unwrap(), Tables::parse(&narrow).unwrap()].into_iter().chain(Tables::supplied().ok()) {
             for model in 0..MODELS as u8 {
                 let start = &t.start[usize::from(model)];
                 for slot in 0..1u32 << 16 {
@@ -1471,10 +1498,8 @@ mod tests {
     /// every model and slot of the shipped tables and ours, at assorted states.
     #[test]
     fn payload_step_matches_the_reference_decode() {
-        for t in [
-            Tables::builtin().unwrap(),
-            Tables::parse(&tables()).unwrap(),
-        ] {
+        // (With the user's tables too, if supplied.)
+        for t in [Tables::parse(&tables()).unwrap()].into_iter().chain(Tables::supplied().ok()) {
             for model in 0..MODELS as u8 {
                 for high in [0x100u32, 0x1234, 0xffff] {
                     for slot in 0..1u32 << 16 {
