@@ -105,6 +105,8 @@ most runs from 22 on (run 26, below).
 | 28 | as 27, the watchdog hook (`VICTORY_NO_WATCHDOG=1`, in the profile), pool windows let go only for another page | ran the full 20 minutes; at most 13.1 GB that could not be reclaimed (peak 17.6 GB with file cache), no driver errors; the title stopped itself at 16m43s with an object pool full (below) |
 | 29 | as 28, pool windows let go only where something read them | stopped by hand at 8 min: at most 12.4 GB that could not be reclaimed, no driver errors; a third fewer windows let go |
 | 30 | as 29, slots that show another copy made again at once | the card filled to 99.8 % of a larger budget and 2.4–3.9 GB of its data went to the PC's memory: at most 15.8 GB that could not be reclaimed, at the cap from 8 min, and 23 failed driver mapping inserts there; the title stopped itself at 13m7s on the same break as run 28 (`+0x63966f`), the same pool at 44,546 of 45,000 |
+| 31 | as 30, `VICTORY_TEXTURE_ROOM_PERCENT=85` | the card held at about 96 % of its budget, the driver's memory at 0.1 GB, at most 12.2 GB that could not be reclaimed; 50+ driver mapping errors 7 minutes in with no memory pressure; the title stopped itself on its full pool at about 13 minutes; no freeze |
+| 32 | as 31, in-place windows indexed by page, disk writes through one view of each section, `VICTORY_TEXTURE_NO_WAIT=1` | the usual frame at 3 minutes 833 ms (about 5 s in run 31), texture refreshes waiting 0 ms (2.8–3.6 s), disk-write views 0 ms (39 s of the workers' time); later frames 1.2–2.9 s, nearly all of it remapping (below); ran the full 20 minutes |
 
 **The driver crash, reproduced outside the title.** The saved shaders
 (`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
@@ -320,6 +322,31 @@ itself on a break (`+0x63966f`). Its crash report shows the same as run
 without a GPU stall. Streaming that would take seconds on a console does
 not finish here, while the title goes on loading the world around it. Why
 is open; it is the next thing to look at after memory.
+
+**Run 32: three speed fixes, and what is left is Wine's remapping.** The
+usual frame at 3 minutes fell from about 5 s to 833 ms:
+
+| At 3 minutes | run 31 | run 32 |
+|---|---|---|
+| usual frame | about 5,000 ms | 833 ms |
+| texture refreshes waiting for title memory to hold still | 2,800–3,600 ms | 0 (`VICTORY_TEXTURE_NO_WAIT=1`) |
+| victory's own notes of each remap | 1,500–3,400 ms | 117 ms (windows in place indexed by page) |
+| views for disk writes | 39 s of the workers' time | 0 (one view of each whole section) |
+
+Later in the run the frames grew to 1.2–2.9 s, nearly all of it remapping:
+1,188 calls taking 2.8 s at 6 minutes, of which victory's notes were 1.2 s
+again (a window over the pool maps its views while it holds the windows'
+lock). A sample over 10 s showed the wineserver at 88 % of one core and
+the title's 108 threads waiting, the process at 70 % of one core: every
+change of a view goes through that one server thread. The way to 60 frames
+a second is fewer such changes, not cheaper ones.
+
+**Moving to trustno1's tree.** trustno1-coder/VIctory-NVIDIA (foxhound base)
+runs 26–30 frames a second on Windows against 8–11 for this tree, and
+already has its own forms of these fixes: one view of each whole section
+for disk writes, texture refreshes that do not wait, and title views kept
+in its books until the title's CPU touches them (`VICTORY_SOFT_VIEWS`).
+This fork's Linux work goes on there, on the branch `kc/foxhound`.
 
 **Frames got slower.** Runs 27–28 drew at 0.1–0.2 frames a second, with
 frames of 5–20 s late in run 28, against about 1 s in run 24 with every
