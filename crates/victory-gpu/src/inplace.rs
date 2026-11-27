@@ -101,8 +101,11 @@ fn most() -> u64 {
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// because of [`most`]; and what was let go because its memory changed;
+/// then, in place now, of the windows: those over the page pool through
+/// views of our own ([`views_on`]) and their bytes; then, since the start,
+/// such windows the host refused.
+static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -112,6 +115,247 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// Where the CPU reads the bytes the buffer shows, from the title
+    /// memory's first byte on: the title's own address, or for a window
+    /// over the page pool our views' ([`OwnViews`]).
+    pub(crate) cpu: u64,
+    /// The views of our own the heap was opened on, if it was: they stay
+    /// mapped until the heap is gone.
+    pub(crate) views: Option<OwnViews>,
+}
+
+/// `VICTORY_INPLACE_VIEWS=1` (off by default; only with
+/// `VICTORY_INPLACE`): a window outside buffers over the page pool (the
+/// title's views of its physical pages) is not copied either. The pages
+/// it covers are mapped again, in the same order, into a range of our
+/// own (where the title shows nothing, a page of zeros), and that range
+/// is opened as a host heap by its address (`OpenExistingHeapFromAddress1`):
+/// shaders read the title's physical pages themselves, as on the console.
+///
+/// Windows of this kind are most of the copies kept in the PC's memory
+/// under Proton (run 25's census: 472 of 790 windows, 2.4 of 3.9 GB, 439
+/// of them with pages the title shows nothing at), and NVIDIA's Linux
+/// driver pins every page of a shared buffer when it is made, read or
+/// not. Windows refuses such a range (it takes one allocation only);
+/// vkd3d-proton hands the address to the driver
+/// (`VK_EXT_external_memory_host`), and the probe says whether the driver
+/// takes it.
+///
+/// shortcut: when the title maps another page into a window's range, the
+/// window is let go ([`title_memory_freeing`]) and the next ask opens a
+/// new one; a descriptor slot written before then still shows the old
+/// window (the memory line counts slots that showed another copy than the
+/// one brought up to date).
+fn views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// A range of our own address space where each 64 KiB page shows a page
+/// of one of the title's sections, or zeros ([`OwnViews::map`]); unmapped
+/// when dropped.
+pub(crate) struct OwnViews {
+    base: usize,
+    len: usize,
+    /// Our views' addresses.
+    views: Vec<usize>,
+}
+
+/// What a page of an [`OwnViews`] shows: a section's handle and the byte
+/// offset of the page in it, or nothing (zeros).
+type Source = Option<(usize, u64)>;
+
+/// The most bytes of zeros one view shows: the size of [`zeros`].
+const ZEROS: usize = 4 << 20;
+
+/// A committed section of [`ZEROS`] bytes that nothing writes, for pages
+/// the title shows nothing at.
+fn zeros() -> Option<usize> {
+    static ZERO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let handle = *ZERO.get_or_init(|| {
+        // SAFETY: a plain section of the page file, kept for the run.
+        unsafe {
+            mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_COMMIT,
+                0,
+                ZEROS as u32,
+                std::ptr::null(),
+            ) as usize
+        }
+    });
+    (handle != 0).then_some(handle)
+}
+
+impl OwnViews {
+    /// Maps `sources` (one per 64 KiB page, in order) into a range of our
+    /// own, one view per run ([`runs`]).
+    fn map(sources: &[Source]) -> Option<OwnViews> {
+        let len = sources.len() * K64;
+        let runs = runs(sources);
+        let zero = if runs.iter().any(|run| run.2.is_none()) { zeros()? } else { 0 };
+        // SAFETY (the block): a placeholder of our own, split and replaced
+        // by views of live sections (the title's, which its views keep
+        // open, and ours); on a failure everything made is undone.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let base = mem::VirtualAlloc2(
+                process,
+                std::ptr::null(),
+                len,
+                mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                mem::PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            if base == 0 {
+                return None;
+            }
+            let mut own = OwnViews { base, len, views: Vec::with_capacity(runs.len()) };
+            for (i, &(page, pages, source)) in runs.iter().enumerate() {
+                let at = base + page * K64;
+                let bytes = pages * K64;
+                // The run is split off the front of what is left of the
+                // placeholder, unless it is all that is left.
+                if i + 1 < runs.len() && mem::VirtualFree(at as *mut c_void, bytes, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER) == 0 {
+                    own.undo(at);
+                    return None;
+                }
+                let (section, offset) = source.unwrap_or((zero, 0));
+                let view = mem::MapViewOfFile3(
+                    section as windows_sys::Win32::Foundation::HANDLE,
+                    process,
+                    at as *const c_void,
+                    offset,
+                    bytes,
+                    mem::MEM_REPLACE_PLACEHOLDER,
+                    mem::PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if view.Value as usize != at {
+                    own.undo(at);
+                    return None;
+                }
+                own.views.push(at);
+            }
+            Some(own)
+        }
+    }
+
+    /// After a failure at `at`: the views made are unmapped, and what is
+    /// left of the placeholder from `at` on (split or not) is released.
+    fn undo(&mut self, at: usize) {
+        self.unmap();
+        let end = self.base + self.len;
+        let mut piece = at;
+        while piece < end {
+            // SAFETY: plain data filled in by the query, of our own range.
+            let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { mem::VirtualQuery(piece as *const c_void, &mut info, size_of_val(&info)) } == 0 || info.RegionSize == 0 {
+                break;
+            }
+            // SAFETY: a placeholder of ours, nothing mapped in it.
+            unsafe { mem::VirtualFree(piece as *mut c_void, 0, mem::MEM_RELEASE) };
+            piece = info.BaseAddress as usize + info.RegionSize;
+        }
+    }
+
+    fn unmap(&mut self) {
+        // SAFETY: a pseudo handle.
+        let process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        for at in self.views.drain(..) {
+            // SAFETY: a view of ours; unmapped without a placeholder, its
+            // range is freed.
+            unsafe { mem::UnmapViewOfFile2(process, mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, 0) };
+        }
+    }
+}
+
+/// The views [`OwnViews::map`] makes for `sources`: (first page, pages,
+/// the first page's source), with pages that follow one another in one
+/// section, and runs of zeros up to [`ZEROS`], joined.
+fn runs(sources: &[Source]) -> Vec<(usize, usize, Source)> {
+    let mut runs: Vec<(usize, usize, Source)> = Vec::new();
+    for (page, &source) in sources.iter().enumerate() {
+        if let Some(last) = runs.last_mut() {
+            let follows = match (last.2, source) {
+                (Some((s, o)), Some((t, p))) => s == t && p == o + (last.1 * K64) as u64,
+                (None, None) => (last.1 + 1) * K64 <= ZEROS,
+                _ => false,
+            };
+            if follows {
+                last.1 += 1;
+                continue;
+            }
+        }
+        runs.push((page, 1, source));
+    }
+    runs
+}
+
+impl Drop for OwnViews {
+    fn drop(&mut self) {
+        self.unmap();
+    }
+}
+
+// SAFETY: only addresses of a range that is ours alone are kept; the CPU
+// never writes through it, the host reads it.
+unsafe impl Send for OwnViews {}
+// SAFETY: as above.
+unsafe impl Sync for OwnViews {}
+
+/// The sources of the 64 KiB pages of `[at, at + len)` (64 KiB aligned),
+/// as the title's views show them now. `None` if no page is in a view, or
+/// if a page in none is committed memory (private memory beside the pool,
+/// which no view of ours can show).
+fn sources(at: usize, len: usize) -> Option<Vec<Source>> {
+    let found: Vec<Source> = {
+        let v = views();
+        (0..len.div_ceil(K64))
+            .map(|k| {
+                let page = at + k * K64;
+                v.views
+                    .range(..=page)
+                    .next_back()
+                    .filter(|(base, view)| **base + view.0 > page)
+                    .map(|(base, view)| (view.1, view.2 + (page - base) as u64))
+            })
+            .collect()
+    };
+    if found.iter().all(Option::is_none) {
+        return None;
+    }
+    for (k, _) in found.iter().enumerate().filter(|(_, s)| s.is_none()) {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery((at + k * K64) as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State == mem::MEM_COMMIT {
+            return None;
+        }
+    }
+    Some(found)
+}
+
+/// Title memory `[start, start + len)` of the page pool in place through
+/// views of our own ([`views_on`]). `Err` with nothing if the memory is
+/// not the pool's or could not be mapped again (nothing was asked of the
+/// host), with the host's error if it refused.
+fn place_views(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let sources = sources(at as usize, bytes as usize).ok_or(None)?;
+    let own = OwnViews::map(&sources).ok_or(None)?;
+    let heap = open(device, From::Part(own.base, own.len)).map_err(Some)?;
+    let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    let cpu = own.base as u64 + (start - at);
+    Ok(Placed { buffer, heap, gpu, bias: start - at, cpu, views: Some(own) })
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -128,7 +372,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, cpu: start, views: None })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -137,6 +381,32 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
+    }
+    // A window over the page pool, through views of our own. Memory that
+    // is not the pool's (or that could not be mapped again) goes on to the
+    // rules below, which turn the pool's down.
+    if window && views_on() {
+        let host = crate::host::host()?;
+        match place_views(&host.device, start, len) {
+            Ok(placed) => {
+                for (at, n) in [(0, 1), (1, len), (8, 1), (9, len)] {
+                    STATS[at].fetch_add(n, Ordering::Relaxed);
+                }
+                return Some(placed);
+            }
+            Err(None) => {}
+            Err(Some(e)) => {
+                if STATS[10].fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(
+                        start = format_args!("{start:#x}"),
+                        len,
+                        error = %e,
+                        "a window over the page pool not opened in place through views of our own: a copy instead"
+                    );
+                }
+                return None;
+            }
+        }
     }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
@@ -168,11 +438,16 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+/// What [`place_for`] gave is gone; `views` if it was over the page pool
+/// through views of our own.
+pub(crate) fn gone(window: bool, bytes: u64, views: bool) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    if views {
+        STATS[8].fetch_sub(1, Ordering::Relaxed);
+        STATS[9].fetch_sub(bytes, Ordering::Relaxed);
+    }
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -199,10 +474,14 @@ fn say() {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
+        "title memory in place: {} windows {} MB ({} of them {} MB over the page pool through views of our own, VICTORY_INPLACE_VIEWS; {} such refused by the host), \
+         {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
         s[1] >> 20,
+        s[8],
+        s[9] >> 20,
+        s[10],
         s[2],
         s[3] >> 20,
         s[4],
@@ -794,6 +1073,11 @@ pub(crate) struct Probe {
     /// A section made with `SEC_RESERVE` (as `xmem` makes the page pool)
     /// was refused.
     pub(crate) reserved_section_refused: bool,
+    /// Pages of a section mapped again into a range of our own (out of
+    /// order, with zeros between) open by that range's address, and the
+    /// GPU reads them in our order, also what the CPU wrote afterwards
+    /// through another view (`VICTORY_INPLACE_VIEWS`).
+    pub(crate) own_views_read: bool,
 }
 
 /// Tries the openings on memory of the probe's own, made the way `xmem`
@@ -825,14 +1109,15 @@ pub(crate) fn probe(device: &ID3D12Device, memory: &dyn Fn() -> Option<[u64; 4]>
     unsafe {
         private(&mut p, &mut rig);
         section(&mut p, &mut rig);
+        own_views(&mut p, &mut rig);
         if mb > 0 {
             cost(&mut p, &mut rig, memory, mb);
         }
     }
     p.lines.push(format!(
         "VERDICT: private memory in place: reads {}, writes {}; the page pool's section in place: reads {}, writes {}, whatever the views do {}; \
-         a reserved section is refused {} (the pool must be made committed to be opened)",
-        p.part_reads, p.part_writes, p.section_reads, p.section_writes, p.section_outlives_views, p.reserved_section_refused
+         a reserved section is refused {} (the pool must be made committed to be opened); the pool through views of our own: reads {}",
+        p.part_reads, p.part_writes, p.section_reads, p.section_writes, p.section_outlives_views, p.reserved_section_refused, p.own_views_read
     ));
     p
 }
@@ -987,6 +1272,67 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
         // The placeholder was split in two: each half is released.
         mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
         mem::VirtualFree(hole.add(8 * K64).cast(), 0, mem::MEM_RELEASE);
+    }
+}
+
+/// Pages of a committed section mapped again into a range of our own as
+/// [`OwnViews`] maps the page pool's: out of order and with a page the
+/// title would show nothing at; that range opened by its address.
+unsafe fn own_views(p: &mut Probe, rig: &mut Rig) {
+    const SIZE: usize = 8 * K64;
+    // SAFETY (the whole function): the section and the views made here.
+    unsafe {
+        let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+        if handle.is_null() {
+            p.lines.push("the pool through views of our own: no section to try with".to_owned());
+            return;
+        }
+        // The title's kind of view of the whole section.
+        let whole = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, SIZE);
+        if whole.Value.is_null() {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            p.lines.push("the pool through views of our own: no view to try with".to_owned());
+            return;
+        }
+        let bytes = whole.Value.cast::<u8>();
+        fill(bytes, SIZE, 7);
+        let page = |k: usize| std::slice::from_raw_parts(bytes.add(k * K64), K64).to_vec();
+        let h = handle as usize;
+        let sources = [Some((h, (5 * K64) as u64)), Some((h, (2 * K64) as u64)), None, Some((h, (3 * K64) as u64))];
+        match OwnViews::map(&sources) {
+            None => p.lines.push("the pool through views of our own: mapping them failed".to_owned()),
+            Some(own) => {
+                let opened = open(&rig.device, From::Part(own.base, own.len));
+                p.lines.push(format!(
+                    "the pool through views of our own, opened by their address (OpenExistingHeapFromAddress1; VICTORY_INPLACE_VIEWS): {}",
+                    hr(&opened)
+                ));
+                if let Ok(heap) = &opened {
+                    match place(&rig.device, heap, 0, own.len as u64) {
+                        Ok(buffer) => {
+                            let mut want = page(5);
+                            want.extend(page(2));
+                            want.extend(vec![0u8; K64]);
+                            want.extend(page(3));
+                            let reads = rig.fetch(&buffer, 0, 4 * K64).is_ok_and(|got| got == want);
+                            fill(bytes.add(2 * K64), K64, 99);
+                            let later = page(2);
+                            let follows = rig.fetch(&buffer, K64 as u64, K64).is_ok_and(|got| got == later);
+                            p.own_views_read = reads && follows;
+                            p.lines.push(format!(
+                                "  the GPU reads the pages in our order, zeros where none: {reads}; and what the CPU wrote afterwards through another view: {follows}"
+                            ));
+                        }
+                        Err(e) => p.lines.push(format!("  a buffer placed in it: REFUSED {:#010x} ({})", e.code().0, e.message().trim())),
+                    }
+                }
+                drop(opened);
+                drop(own);
+            }
+        }
+        mem::UnmapViewOfFile(whole);
+        windows_sys::Win32::Foundation::CloseHandle(handle);
     }
 }
 
@@ -1260,6 +1606,22 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our own views of the pool: pages that follow one another in one
+    /// section are one view, a page from elsewhere starts another, and
+    /// runs of zeros are joined up to the zero section's size.
+    #[test]
+    fn own_views_join_what_follows() {
+        let k = K64 as u64;
+        let sources = [Some((9, 4 * k)), Some((9, 5 * k)), Some((9, 2 * k)), Some((8, 3 * k)), None, None, Some((8, 4 * k))];
+        assert_eq!(
+            runs(&sources),
+            vec![(0, 2, Some((9, 4 * k))), (2, 1, Some((9, 2 * k))), (3, 1, Some((8, 3 * k))), (4, 2, None), (6, 1, Some((8, 4 * k)))]
+        );
+        let holes = vec![None; ZEROS / K64 + 3];
+        assert_eq!(runs(&holes), vec![(0, ZEROS / K64, None), (ZEROS / K64, 3, None)]);
+        assert!(runs(&[]).is_empty());
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

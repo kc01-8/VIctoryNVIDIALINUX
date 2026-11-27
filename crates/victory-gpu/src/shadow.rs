@@ -80,6 +80,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// For a window over the page pool in place, the views of our own its
+    /// heap was opened on (`crate::inplace::OwnViews`). Last, so that it
+    /// goes after the buffer and the heap.
+    views: Option<crate::inplace::OwnViews>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2834,7 +2838,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, self.views.is_some());
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -3180,8 +3184,11 @@ impl Shadow {
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+        if window {
+            IN_PLACE_LONGEST.fetch_max(len, Ordering::Relaxed);
+        }
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
-        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+        let mut shadow = Shadow::new(placed.buffer, placed.cpu as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -3189,6 +3196,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.views = placed.views;
         shadow
     }
 
@@ -3226,6 +3234,7 @@ impl Shadow {
             window: false,
             uploaded: 0,
             place: None,
+            views: None,
         }
     }
 
@@ -4648,6 +4657,10 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
         .map(|(k, e)| (k.0, e.end - k.0))
 }
 
+/// The longest window outside buffers put in place so far, in bytes: how
+/// far below a range [`in_place_let_go`] looks for windows that reach it.
+static IN_PLACE_LONGEST: AtomicU64 = AtomicU64::new(0);
+
 /// Title memory `[at, at + len)` is about to show something else or be
 /// given up: what is in place there (`crate::inplace`) is taken out of the
 /// tables, so that the next ask makes a copy or opens the memory anew, and
@@ -4657,8 +4670,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // Every window in place that reaches `at` begins no lower than the
+        // longest such window below it.
+        let reach = IN_PLACE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .range((at.saturating_sub(reach), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
