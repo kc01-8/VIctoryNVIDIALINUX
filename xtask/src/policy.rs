@@ -33,6 +33,17 @@ const ALLOWED_NAMES: &[&str] = &[
 /// the user and kept out of the repository, docs/asset-policy.md.)
 const EXCEPTIONS: &[(&str, &str)] = &[];
 
+/// Logs of runs are not published in this fork (docs/asset-policy.md): they
+/// record what a title did. Nothing under this folder is accepted.
+const RUN_LOG_DIR: &str = "diagnostics/";
+
+/// A run profile, `profiles/<name>.env`: switch lines for `scripts/kc-run.sh`.
+/// `.env` is allowed only there, so a local file of secrets elsewhere is not.
+fn is_profile(path: &str) -> bool {
+    path.strip_prefix("profiles/")
+        .is_some_and(|name| !name.contains('/') && name.ends_with(".env"))
+}
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -145,12 +156,17 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
+    if path.starts_with(RUN_LOG_DIR) {
+        problems.push("run logs are not published here (docs/asset-policy.md)".to_owned());
+        return problems;
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
+            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e))
+        || is_profile(path);
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
@@ -295,5 +311,14 @@ mod tests {
             table.join(",\n    ")
         );
         assert!(check("src/table.rs", src.as_bytes()).is_empty());
+    }
+
+    /// Nothing under `diagnostics/` is accepted, however small or textual.
+    #[test]
+    fn run_logs_are_refused() {
+        assert!(!check("diagnostics/run-1.txt", b"frame 1").is_empty());
+        assert!(!check("diagnostics/run-1.txt.gz", &[0x1f, 0x8b, 8, 0, 0, 0]).is_empty());
+        assert!(!check("diagnostics/README.md", b"# runs").is_empty());
+        assert!(check("docs/run-notes.md", b"# notes").is_empty());
     }
 }
