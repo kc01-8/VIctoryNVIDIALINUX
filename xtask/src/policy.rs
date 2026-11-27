@@ -37,6 +37,13 @@ const EXCEPTIONS: &[(&str, &str)] = &[(
 /// record what a title did. Nothing under this folder is accepted.
 const RUN_LOG_DIR: &str = "diagnostics/";
 
+/// A run profile, `profiles/<name>.env`: switch lines for `scripts/kc-run.sh`.
+/// `.env` is allowed only there, so a local file of secrets elsewhere is not.
+fn is_profile(path: &str) -> bool {
+    path.strip_prefix("profiles/")
+        .is_some_and(|name| !name.contains('/') && name.ends_with(".env"))
+}
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -158,7 +165,8 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let allowed = ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
+            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e))
+        || is_profile(path);
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
@@ -213,6 +221,9 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("profiles/default.env", b"VICTORY_LOG=info\n").is_empty());
+        assert!(!check("local.env", b"KEY=1\n").is_empty(), ".env only under profiles/");
+        assert!(!check("profiles/deeper/x.env", b"KEY=1\n").is_empty());
     }
 
     #[test]

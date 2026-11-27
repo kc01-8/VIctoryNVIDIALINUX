@@ -62,8 +62,10 @@ cache home by default.
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 1 MiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. Exceptions need an entry
-   with a reason in `xtask/src/policy.rs`.
+   signatures, and hold no long hex/base64 runs. `.env` is allowed only
+   for run profiles directly under `profiles/` (switch lines for
+   `scripts/kc-run.sh`). Exceptions need an entry with a reason in
+   `xtask/src/policy.rs`.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables
