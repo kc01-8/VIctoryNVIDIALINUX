@@ -946,6 +946,10 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 /// read stale.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+/// Buffer views of the heap made again because the copy in place they
+/// showed was taken out of the tables, since the start (for the memory
+/// line).
+pub(crate) static HEAP_VIEWS_REMADE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -2174,13 +2178,34 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let mut slots = if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
         *passes += 1;
+        // Slots that show a copy in place that was taken out of the tables
+        // since (the title mapped its memory anew, `Shadow::let_go`) show
+        // old pages: they are made again in this pass, from the copy their
+        // view finds now. Looked for only when such a copy went.
+        {
+            static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+            let now = crate::shadow::in_place_gone();
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let last = seen.get_or_insert_with(Default::default).entry(std::ptr::from_ref(host) as usize).or_insert(0);
+            if *last != now {
+                *last = now;
+                let stale: Vec<u32> = ranges.iter().filter(|(_, (shadow, ..))| shadow.let_go()).map(|(&index, _)| index).collect();
+                if !stale.is_empty() {
+                    HEAP_VIEWS_REMADE.fetch_add(stale.len() as u64, Ordering::Relaxed);
+                    host.remake_later(&stale);
+                    slots.extend(stale);
+                    slots.sort_unstable();
+                    slots.dedup();
+                }
+            }
+        }
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

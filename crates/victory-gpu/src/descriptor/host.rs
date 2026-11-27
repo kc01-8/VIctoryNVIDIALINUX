@@ -1839,6 +1839,17 @@ impl HostHeap {
 
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
+    /// Slots `slots` are made again at their next look ([`HostHeap::mirror`])
+    /// from the copy their view finds then: each showed a copy in place
+    /// that was taken out of the tables (`Shadow::let_go`). Until then each
+    /// is a null view, as a slot being made again is.
+    pub(crate) fn remake_later(&self, slots: &[u32]) {
+        let mut made = locked(&self.made, 4);
+        for &index in slots {
+            self.unmake(&mut made, index);
+        }
+    }
+
     fn unmake(&self, made: &mut [u64], index: u32) {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
