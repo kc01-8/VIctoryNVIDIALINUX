@@ -506,30 +506,33 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// vkd3d-proton refuses a zero-length blob whose pointer is not null; a Rust
+/// empty slice's pointer never is.
+fn null_when_empty(bytes: &[u8]) -> *const std::ffi::c_void {
+    if bytes.is_empty() {
+        return std::ptr::null();
+    }
+    bytes.as_ptr().cast()
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // An empty library is asked for with no blob (a null pointer), not
-        // an empty slice, whose pointer is never null: vkd3d-proton refuses
-        // a zero length with a pointer (E_INVALIDARG), so under Proton no
-        // library was made and nothing was kept or started early (kc/nvidia
-        // 742719b0).
-        let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: the bytes outlive the library (kept beside it); the out
-        // pointer is ours and holds a new reference on success.
+        let pointer = null_when_empty(bytes);
+        let mut library: Option<ID3D12PipelineLibrary> = None;
+        // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
-                windows::core::Interface::as_raw(device),
-                blob,
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                pointer,
                 bytes.len(),
-                &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
-                &mut raw,
+                &ID3D12PipelineLibrary::IID,
+                (&raw mut library).cast(),
             )
             .ok()?;
-            <ID3D12PipelineLibrary as windows::core::Interface>::from_raw(raw).cast()
         }
+        library.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER))?.cast()
     };
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
