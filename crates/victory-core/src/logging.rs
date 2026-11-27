@@ -4,6 +4,10 @@
 //! `VICTORY_LOG=victory_loader=trace,info`. Debug and trace output exist
 //! only in builds with the `diagnostics` feature; a plain release build
 //! logs info and above whatever the filter asks for.
+//!
+//! `VICTORY_LOG_FILE=<path>` writes the same lines to that file as well
+//! (appended), for launchers that do not hand the process a console, such
+//! as Proton Experimental.
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -23,6 +27,14 @@ pub fn init(default_level: &str) {
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
+    let file = std::env::var_os("VICTORY_LOG_FILE").and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .inspect_err(|e| eprintln!("VICTORY_LOG_FILE {}: {e}", path.to_string_lossy()))
+            .ok()
+    });
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)
@@ -31,5 +43,11 @@ pub fn init(default_level: &str) {
                 .with_target(true)
                 .with_writer(std::io::stderr),
         )
+        .with(file.map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+        }))
         .try_init();
 }
