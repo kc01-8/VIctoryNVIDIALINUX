@@ -49,7 +49,7 @@ L="-p victory-core -p victory-pe -p victory-formats -p victory-pipeline \
    -p victory-game -p victory-loader -p xtask"
 cargo clippy --all-targets --locked $L -- -D warnings
 cargo clippy --lib --locked -p victory-shader -- -D warnings
-cargo test --locked $L -p victory-shader -- --exact \
+cargo test --locked $L -- --exact \
   --skip image::tests::parses_own_test_binary \
   --skip image::tests::rva_to_file_offset_maps_entry_point \
   --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib \
@@ -63,7 +63,9 @@ cargo xtask install-hooks       # asset-policy check on every commit
 The skipped `victory-pe` and `victory-loader` tests parse the test
 executable itself as a PE image, which is an ELF on Linux; they still run
 on Windows. `victory-shader`'s test target has a helper only the Windows
-tests use, so only its library is linted.
+tests use, so only its library is linted. Its tests no longer build natively
+(they use the Windows-only DXIL validator, `emit::validator`), so they are
+left out of `cargo test` above.
 
 Keep `TMPDIR` outside the checkout. `victory-core`'s policy tests make
 temporary folders and expect them to be outside the repository, so with
@@ -80,7 +82,8 @@ To run the Windows test binaries under Wine/Proton, cross-build them with
 environment from the next section) and run the `.exe` files under
 `target/x86_64-pc-windows-msvc/debug/deps/` with `wine`. Known Wine/vkd3d
 gaps make a few of them fail; see #232 and #235 for the current counts and
-the `load_probe` workaround (`VICTORY_HLE_PROBE_DLL`).
+the `load_probe` workaround (`VICTORY_HLE_PROBE`, see
+[proton-launcher.md](proton-launcher.md)).
 
 ## Tools on Linux vs running the title
 
@@ -250,7 +253,8 @@ Two ways out, both tried on GE-Proton11-14 (Wine 11.0) with RADV on an RX 9070
 XT:
 
 - let the DXC fallback compile it: an embedded helper, or `VICTORY_DXC`
-  pointing at `dxcompiler.dll`, or `dxcompiler.dll` beside the exe;
+  pointing at `dxcompiler.dll`, or `dxcompiler.dll` beside the exe (this
+  fork does not have that fallback yet; see [kc-linux-status.md](kc-linux-status.md));
 - or copy Microsoft's `d3dcompiler_47.dll` into the run directory and set
   `WINEDLLOVERRIDES=d3dcompiler_47=n,b`, which keeps the builtin as a
   fallback. `WINEDEBUG=+loaddll` shows which one loaded.
