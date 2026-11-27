@@ -3113,6 +3113,17 @@ impl HostHeap {
         }
     }
 
+    /// Slots `slots` are made again at their next look ([`HostHeap::mirror`])
+    /// from the copy their view finds then: each showed a copy in place
+    /// that was taken out of the tables (`Shadow::let_go`). Until then each
+    /// is a null view, as a slot being made again is.
+    pub(crate) fn remake_later(&self, slots: &[u32]) {
+        for &index in slots {
+            let _made = self.made.lock(index);
+            self.unmake(index);
+        }
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {

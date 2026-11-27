@@ -50,6 +50,10 @@ pub(crate) struct Shadow {
     ranged: Mutex<[(usize, usize, u64); 2]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Taken out of the tables while in place, because the title mapped
+    /// its memory anew ([`in_place_let_go`], [`own_views_mapped`]): a
+    /// descriptor slot that shows it is made again ([`in_place_gone`]).
+    gone: std::sync::atomic::AtomicBool,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -3132,6 +3136,12 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Whether this copy in place was taken out of the tables because the
+    /// title mapped its memory anew (a slot that shows it shows old pages).
+    pub(crate) fn let_go(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -3187,6 +3197,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
+            gone: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -5106,6 +5117,26 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// far below a range [`in_place_let_go`] looks for windows that reach it.
 static IN_PLACE_LONGEST: AtomicU64 = AtomicU64::new(0);
 
+/// Copies in place taken out of the tables so far ([`Shadow::let_go`]).
+static IN_PLACE_GONE: AtomicU64 = AtomicU64::new(0);
+
+/// How many copies in place were taken out of the tables so far: the pass
+/// over the view heap's buffer views looks for slots that show one when
+/// this changes (`draw.rs`).
+pub(crate) fn in_place_gone() -> u64 {
+    IN_PLACE_GONE.load(Ordering::Acquire)
+}
+
+/// Marks copies in place as taken out of the tables, then counts them.
+fn mark_gone(gone: &[Arc<Shadow>]) {
+    for shadow in gone {
+        shadow.gone.store(true, Ordering::Release);
+    }
+    if !gone.is_empty() {
+        IN_PLACE_GONE.fetch_add(gone.len() as u64, Ordering::AcqRel);
+    }
+}
+
 /// Title memory `[at, at + len)` is about to show something else or be
 /// given up: what is in place there (`crate::inplace`) is taken out of the
 /// tables, so that the next ask makes a copy or opens the memory anew, and
@@ -5120,7 +5151,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         let reach = IN_PLACE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(reach), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            // Windows over the pool through views of our own go only when
+            // the title maps other pages there (`own_views_mapped`).
+            .filter(|(key, shadow)| shadow.place.is_some() && shadow.views.is_none() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
@@ -5135,10 +5168,41 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    mark_gone(&gone);
     for shadow in gone {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// The title mapped the section's pages from `offset` on at `[at, at +
+/// len)`: windows over the pool in place there (`crate::inplace`, views of
+/// our own) that showed other pages are taken out of the tables, as
+/// [`in_place_let_go`] does. Returns how many were kept (they show those
+/// very pages) and how many went.
+pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -> (u64, u64) {
+    let end = at.saturating_add(len);
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let mut kept = 0;
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let reach = IN_PLACE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
+        let mut keys = Vec::new();
+        for (key, shadow) in map.range((at.saturating_sub(reach), 0)..(end, 0)) {
+            match shadow.views.as_ref().and_then(|views| views.shows(at, len, section, offset)) {
+                Some(false) => keys.push(*key),
+                Some(true) => kept += 1,
+                None => {}
+            }
+        }
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+    }
+    let n = gone.len() as u64;
+    mark_gone(&gone);
+    for shadow in gone {
+        crate::host::retire(shadow);
+    }
+    (kept, n)
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
