@@ -1,6 +1,6 @@
 ﻿//! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
-//! The title presents so on Series S.
+//! The game presents so on Series S.
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
