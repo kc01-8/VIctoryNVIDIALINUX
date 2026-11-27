@@ -19,7 +19,7 @@ the game's developer or publisher, or by Microsoft.
 | Cross-building `victory.exe` on Linux | ✅ works |
 | Launcher, smoke and loader tests under Proton (no game files) | ✅ pass |
 | The GPU helper shaders under Proton (indirect draws, masked patch, card compare, card fetch) | ✅ compiled with DXC, because Wine's own compiler refuses them; their tests pass on an RTX 3080 Ti |
-| Running a title under Proton | ⚠️ boots, loads and draws the first scenes (thousands of draws a frame, under 1 fps while its pipelines are first built), then runs out of memory under an 18 GB cap. Needs Proton Experimental **and vkd3d-proton built from master** (below): the vkd3d-proton in current Proton releases crashes on some of the title's shaders |
+| Running a title under Proton | ⚠️ boots, loads and draws the first scenes (thousands of draws a frame, 0.2–1 fps), and ends after 7–10 minutes: at an 18 GB cap, or (run 26, 16.2 GB) when the title stops itself. Needs Proton Experimental **and vkd3d-proton built from master** (below): the vkd3d-proton in current Proton releases crashes on some of the title's shaders |
 | Performance measurements on Linux | none yet |
 
 The details, with the commands that produced them, are in
@@ -64,12 +64,18 @@ as the work moves on.
   DLLs from the executable's folder first), or pass their folder to
   `kc-run.sh --vkd3d`. The Proton log (`PROTON_LOG=1`) names the build that
   loaded.
-- **Memory.** On Windows the title takes about 23–27 GB of a 32 GB PC while
-  playing (hyphennn's figures), and it needs as much here. A 12 GB card
-  fills to its 10.2 GB budget, and the rest of the GPU's data goes to system
-  memory (6 GB in run 24). That counts against a memory cap, so an 18 GB
-  cap is too small. The first build of its pipelines also takes several
+- **Memory.** The title's own memory is about 8 GB, and the goal is
+  12–14 GB for a whole run, as on a console. Today a run goes past 16–18
+  GB, because victory keeps copies of title memory in the PC's memory for
+  the GPU, and NVIDIA's Linux driver pins every page of those buffers
+  when they are made (Windows pages out what nothing touches). This is
+  being cut down (see the status doc). `VICTORY_WINDOW_KB=512
+  VICTORY_WINDOW_TAILS=1` makes those copies smaller (run 26 peaked at
+  16.2 GB). The first build of the title's pipelines also takes several
   GB at once: `VICTORY_PIPELINE_WORKERS=4` builds fewer at a time.
+- **If a run is killed while NVIDIA's driver is logging mapping errors**
+  (`NVRM: intermapRegisterDmaMapping` in `journalctl -k`), the driver can
+  stay stuck (`nvidia-smi` hangs) until the PC is restarted.
 - **DXC**, Microsoft's open-source shader compiler: `dxcompiler.dll` and
   `dxil.dll` from `bin/x64` of a
   [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases).

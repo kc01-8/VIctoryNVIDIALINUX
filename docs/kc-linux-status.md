@@ -86,7 +86,8 @@ RTX 3080 Ti (12 GB, driver 620.73.04), 32 GB RAM, `scripts/kc-run.sh
 --mem-max 18G --watchdog`, HUD off, diagnostics build from run 14 on, Enter
 pressed once 18 s in (`VICTORY_KEYS=18:Enter`) from run 20 on. Every run
 maps the title, binds all imports (`missing=0`) and reaches the menus. No
-NVRM Xid in any run.
+NVRM Xid in any run, but NVIDIA's kernel driver logs mapping errors in
+most runs from 22 on (run 26, below).
 
 | Runs | Proton | What ended them |
 |---|---|---|
@@ -98,6 +99,8 @@ NVRM Xid in any run.
 | 22 | as 20, the pipeline library fixed, `VICTORY_PIPELINE_COMPUTE_WAIT=0` | through the load into the first 3D scenes (up to 6,000 draws a frame, under 1 fps); killed by the kernel at the 18 GB cap 3m30s in, with 12 pipeline workers |
 | 23 | as 22, `VICTORY_PIPELINE_WORKERS=4`, the library from run 22 | in the 3D scenes 2m25s in and still drawing (0.2–0.5 fps, peak 15.9 GB) when `kc-run.sh`'s own watchdog killed it at 5 min: it watched `run.log`, which stops growing once the log goes to `victory.log` (fixed) |
 | 24 | as 23, the watchdog fixed | every known pipeline made 1m20s in, before the load; in the 3D scenes from 2 min at 0.1–0.8 fps, at the 18 GB cap from about 2m20s; killed by the kernel at the cap 9m30s in (below) |
+| 25 | as 24, `VICTORY_INPLACE=1 VICTORY_INPLACE_PROBE=1` | killed by the kernel at the cap 7m10s in; 80 windows (380 MB) in place, the rest could not be (below) |
+| 26 | as 25 without the probe, `VICTORY_WINDOW_KB=512 VICTORY_WINDOW_TAILS=1` | peak 16.2 GB, under the cap; the title stopped itself 9m44s in (two of its object pools full), after a rising count of NVIDIA driver errors; when the run was killed the driver stayed stuck (below) |
 
 **The driver crash, reproduced outside the title.** The saved shaders
 (`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
@@ -189,9 +192,10 @@ frame of run 23); the GPU's own work is about 0.3 s.
   heaps, and what no longer fits the card, which was full at 11.9 of 12 GB.
   It also held 5.2 GB of Wine mappings (the title's memory) and 4.7 GB of
   heap.
-- **The cap is too low.** hyphennn's Windows runs take 23–27 GB of a 32 GB
-  PC, plus 9.2–9.6 GB of the card, while playing. An 18 GB cap is below
-  what the title needs.
+- **Not the title's needs (corrected).** hyphennn's 23–27 GB is what is
+  committed on a 32 GB PC; by their own account about 16 GB of it is in
+  memory. The title runs on consoles with about 13.5 GB for everything,
+  and on 16 GB PCs. The excess here is victory's (runs 25–26, below).
 - **The second run is faster, not instant.** Run 23 loaded run 22's library
   and started 1,621 pipelines early. The 33 pipelines that took over 1 s in
   run 22 (189 s together) took 82 s together in run 23. A known pipeline
@@ -216,9 +220,64 @@ until it killed the run for memory 9m30s in.
   page tables and slab come to 136 MiB, so the rest is memory charged by a
   driver: the GPU's data in the PC's memory. It grew about 1.2 GB a minute
   as the title streamed its world in.
-- **The fix is more memory, not a fix in victory.** The title's own needs
-  are what fill the cap. A cap near what the title takes on Windows (23–27
-  GB of 32) is needed, or the title kept from using so much of the card.
+- **What fills the cap is victory's, not the title's** (an earlier version
+  of this note said the opposite). See runs 25–26.
+
+**Runs 25–26: where the memory goes.** The goal is 12–14 GB for a run, as
+on a console. The title's own crash report (run 26, 9m44s in) puts its own
+memory at about 8 GB: its tile heap 4.3 of 6.2 GB, its physical memory
+2.2 GB, its virtual memory 1.0 GB and its pool 0.6 GB. Wine, vkd3d-proton,
+the driver and victory's own allocations (1.3 GB) add 2–3 GB. The rest of
+a run's 18 GB is GPU data that victory keeps in the PC's memory:
+
+- **Windows outside buffers are the largest part.** These are copies of
+  title memory that the title reads from without a buffer of its own
+  (vertices, indices, constants from its allocators). They are cut on a
+  4 MiB grid. In run 24, 1,024 of them held 4.7 GB, and only 2.1 GB of that
+  had ever been copied: the rest is pages the title never mapped or never
+  wrote. NVIDIA's Linux driver allocates and pins every page of a buffer
+  in the PC's memory when it is made, read or not, and the run's cgroup
+  has no swap. Windows pages out memory that nothing touches.
+- **The census (run 25, `VICTORY_INPLACE_PROBE=1`).** Of 790 windows
+  (3,856 MB), 439 (2,200 MB) lie over the title's page pool with pages it
+  has not mapped; 240 (1,124 MB) over private memory not committed whole,
+  or guarded; only 77 (368 MB) over private memory that `VICTORY_INPLACE=1`
+  can open in place; 31 (152 MB) over one run of a pool section. The
+  probe passes under Proton: vkd3d-proton and the driver open title memory
+  as a heap, the GPU reads what the CPU writes there, and a shader's
+  write through it is refused (in-place windows only read).
+- **In place alone is not enough.** Run 25 had 80 windows (380 MB) in
+  place and reached the cap at about the same time as run 24.
+- **A finer grid helps.** Run 26 cut windows on a 512 KiB grid, with an
+  ask without a length taking its cell's tail (`VICTORY_WINDOW_KB=512
+  VICTORY_WINDOW_TAILS=1`, hyphennn's switches, off by default). Windows
+  held 2.7–3.3 GB, and the run peaked at 16.2 GB, under the cap for the
+  first time since run 22.
+- **Next: windows over the page pool in place.** The pool is a committed
+  section under Wine. Victory can map the pool pages a window covers,
+  in order, into a range of its own (a page of zeros where the title
+  mapped none) and open that range by its address. Windows refuses such
+  a range, but vkd3d-proton passes it to the driver. Written
+  (`VICTORY_INPLACE_VIEWS=1`, with a probe case of its own), not run yet.
+
+**Run 26 ended in the title and the driver.** Frames slowed from about
+0.6 s to 3.5–5 s in its last minutes, nearly all of it in submit calls.
+Then the title stopped itself (a break in seven of its threads). Its
+crash report shows two of its object pools full (45,000 of 45,000 and
+22,334 of 22,500 entries); in its 13 earlier reports, from runs that
+ended within 3 minutes, both were under half full. Its streaming of the
+opening scene had still not finished after nearly 10 minutes.
+
+From 2 minutes in, NVIDIA's kernel driver logged mapping errors
+("intermapRegisterDmaMapping: Failed to insert new mapping node",
+assertions in `gpu_vaspace.c`, "can't update VA space for mapping"): 32
+in one minute, 229 in its last two minutes before the title stopped.
+The same errors appear in runs 22, 24 and 25, a few at a time, so
+in-place windows did not bring them. When `kc-run.sh`'s watchdog
+killed the stuck run, two of its processes were left in the driver's
+close path (`nvkms_close`, `drm_release`), and `nvidia-smi` waits on the
+driver's lock. These processes can't be killed, so only a reboot clears
+the driver. What makes these mappings fail is not known yet.
 
 **First performance notes (run 24, all pipelines made).** A frame took
 about 1 s, and the card was idle for 0.9 s of it; the time goes to the CPU
