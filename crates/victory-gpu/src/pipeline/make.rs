@@ -504,6 +504,9 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // One compute build (fdd56d97a806bcca, run 17) overflowed
+                // the default 2 MiB here under Proton, as on a title thread.
+                .stack_size(super::TRANSLATE_STACK)
                 .spawn(|| {
                     loop {
                         next().make();
