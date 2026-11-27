@@ -111,9 +111,19 @@ Windows runs on an RTX 4070 refused both too and went on, so these alone
 may not be what stops the title here.
 
 **Open: the abort.** It comes after about 30 s in which the process is
-nearly idle (0.1–0.2 of 16 cores) and nothing is presented; the last
-work before it is pipeline creation while loading. Next: every thread's
-stack when it happens (a diagnostics build).
+nearly idle (0.1–0.2 of 16 cores) and nothing is presented. In runs 11–14
+it began within a second of a compute pipeline being refused or skipped.
+
+Run 14 (diagnostics build, `VICTORY_STACKS_ON_CRASH=1`, stacks named with
+`scripts/kc-symbolize.sh`): a title thread recording a dispatch
+(`list::state::dispatch` → `draw::State::dispatch_x` →
+`pipeline::make::ready`) waits in the pipeline's `OnceLock` for its build,
+and no thread is making it: all 12 pipeline workers wait for work, no
+other thread is in `HostPipeline::new`, no panic or other exception was
+logged. Ruled out: a lost wakeup in Wine's `WaitOnAddress` (100,000 rounds
+of racing `OnceLock` waiters under both Protons, none stuck) and a dead
+worker. The build's thread is now logged when another thread waits for it
+(`a7267ff7`); the next run says which thread to look at.
 
 **Runs need no network.** The title's crash handler tried to upload its
 report; victory blocked it (`HTTP connection blocked`).
