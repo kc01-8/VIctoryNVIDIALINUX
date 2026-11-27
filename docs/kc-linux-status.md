@@ -71,12 +71,21 @@ VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
 
 ## Notes
 
-- **Indirect draws under Proton (blocker for real runs).** The clamp is
-  compiled with `D3DCompile`. Wine's builtin `d3dcompiler_47` refuses it
-  (`Load` on `RWByteAddressBuffer`, see `linux-proton.md`), and then every
-  indirect draw and dispatch is dropped. The options are Microsoft's
-  `d3dcompiler_47.dll` with `WINEDLLOVERRIDES=d3dcompiler_47=n,b`, or porting
-  jman's DXC fallback / embedded helpers (`dffc5924`). Not yet tested here.
+- **Runtime HLSL helpers under Proton (blocker for real runs).** Measured
+  with `hlsl_probe` (victory-gpu lib test) on UMU-Proton 11.0-2e and the
+  builtin `d3dcompiler_47`:
+
+  | Helper | Result | Effect at runtime |
+  |---|---|---|
+  | indirect argument clamp (`indirect.rs`) | ❌ `clamp:58:32 E5005 'Load'` on `RWByteAddressBuffer` | every indirect draw and dispatch dropped |
+  | depth twin converter (`twin.rs`) | ❌ `depth:17:19 E5005 'Load'` on `RWByteAddressBuffer` | no depth twins |
+  | present compositor vs/ps (`host.rs`) | ✅ | none |
+
+  The other seven `D3DCompile` calls in victory-gpu are test-only. Options:
+  Microsoft's `d3dcompiler_47.dll` with `WINEDLLOVERRIDES=d3dcompiler_47=n,b`,
+  or one shared helper-compile path with DXC (after jman `dffc5924`, extended
+  to the twin converter). Run the probe again with whichever fix is chosen:
+  `umu-run Z:\...\victory_gpu-*.exe hlsl_probe --nocapture`.
 - This tree has no `VICTORY_DXC`. The indirect-argument clamp compiles with
   `D3DCompile` (`crates/victory-gpu/src/indirect.rs`), and only the validator
   path reads `VICTORY_DXIL`. jman's fork added `VICTORY_DXC` and embedded
