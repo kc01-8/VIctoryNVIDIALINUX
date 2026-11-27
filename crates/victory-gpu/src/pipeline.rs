@@ -137,6 +137,38 @@ pub(crate) struct Translated {
     pub(crate) threads: [u32; 3],
 }
 
+/// The stack a translation runs on. The translator recurses over a
+/// program's structure and keeps large frames: on a title thread (1 MiB,
+/// as the title made it) one compute program overflowed the stack, which
+/// ends the thread without unwinding, so the pipeline it was making stayed
+/// "being made" and every thread that needed it waited until the title
+/// aborted itself (Proton, runs 10-15; Wine: "stack overflow ... addr
+/// victory.exe+...", `___chkstk_ms`). Address space only; pages are used as
+/// the stack grows.
+#[cfg(windows)]
+const TRANSLATE_STACK: usize = 64 << 20;
+
+/// [`translate`] on a thread of its own with [`TRANSLATE_STACK`], whatever
+/// thread asks; on that thread directly if one cannot be made.
+#[cfg(windows)]
+fn translate_on_own_stack(container: &[u8]) -> Result<Translated, String> {
+    std::thread::scope(|s| {
+        match std::thread::Builder::new()
+            .name("victory-translate".into())
+            .stack_size(TRANSLATE_STACK)
+            .spawn_scoped(s, || translate(container))
+        {
+            Ok(thread) => thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread for a translation: it runs on the asking thread");
+                translate(container)
+            }
+        }
+    })
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
@@ -144,7 +176,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate_on_own_stack(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
