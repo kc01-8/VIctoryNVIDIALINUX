@@ -101,6 +101,10 @@ most runs from 22 on (run 26, below).
 | 24 | as 23, the watchdog fixed | every known pipeline made 1m20s in, before the load; in the 3D scenes from 2 min at 0.1–0.8 fps, at the 18 GB cap from about 2m20s; killed by the kernel at the cap 9m30s in (below) |
 | 25 | as 24, `VICTORY_INPLACE=1 VICTORY_INPLACE_PROBE=1` | killed by the kernel at the cap 7m10s in; 80 windows (380 MB) in place, the rest could not be (below) |
 | 26 | as 25 without the probe, `VICTORY_WINDOW_KB=512 VICTORY_WINDOW_TAILS=1` | peak 16.2 GB, under the cap; froze the desktop 9m44s in: NVIDIA's driver looped holding its global lock while the title's process exited, after many failed GPU mappings (a 620.x driver bug, below); needed a reboot |
+| 27 | as 25 on the 4 MiB grid, `VICTORY_INPLACE_VIEWS=1` (windows over the page pool in place) | peak 15.0 GB, no driver errors; 1,461 windows (6.6 GB of title memory) read in place; the title's progress watchdog ended it 5m30s in (below) |
+| 28 | as 27, the watchdog hook (`VICTORY_NO_WATCHDOG=1`, in the profile), pool windows let go only for another page | ran the full 20 minutes; at most 13.1 GB that could not be reclaimed (peak 17.6 GB with file cache), no driver errors; the title stopped itself at 16m43s with an object pool full (below) |
+| 29 | as 28, pool windows let go only where something read them | stopped by hand at 8 min: at most 12.4 GB that could not be reclaimed, no driver errors; a third fewer windows let go |
+| 30 | as 29, slots that show another copy made again at once | the card filled to 99.8 % of a larger budget and 2.4–3.9 GB of its data went to the PC's memory: at most 15.8 GB that could not be reclaimed, at the cap from 8 min, and 23 failed driver mapping inserts there; the title stopped itself at 13m7s on the same break as run 28 (`+0x63966f`), the same pool at 44,546 of 45,000 |
 
 **The driver crash, reproduced outside the title.** The saved shaders
 (`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
@@ -255,12 +259,73 @@ a run's 18 GB is GPU data that victory keeps in the PC's memory:
   GB, under the cap for the first time since run 22. But it made windows
   about four times as often, which the 620 driver's bug feeds on (below):
   not recommended.
-- **Next: windows over the page pool in place.** The pool is a committed
-  section under Wine. Victory can map the pool pages a window covers,
-  in order, into a range of its own (a page of zeros where the title
-  mapped none) and open that range by its address. Windows refuses such
-  a range, but vkd3d-proton passes it to the driver. Written
-  (`VICTORY_INPLACE_VIEWS=1`, with a probe case of its own), not run yet.
+- **Windows over the page pool in place (runs 27–28).** The pool is a
+  committed section under Wine. With `VICTORY_INPLACE_VIEWS=1` (and
+  `VICTORY_INPLACE=1`) victory maps the pool pages a window covers, in
+  order, into a range of its own (a page of zeros where the title mapped
+  none) and opens that range as a heap by its address. Windows refuses
+  such a range; vkd3d-proton passes it to the driver, and the probe
+  shows the driver takes it: the GPU reads the pages in that order,
+  zeros where none, and what the CPU writes afterwards through another
+  view. Shaders then read the title's own pages, as on the console, and
+  nothing is copied.
+
+  | | run 24 | run 27 | run 28 |
+  |---|---|---|---|
+  | windows read in place | 0 | 1,461 (6.6 GB) | 1,136 (5.3 GB) |
+  | shared buffers made, all run | 6,218 (11.1 GB) | 4,121 (1.4 GB) | 4,274 (1.6 GB) |
+  | the driver's memory (cgroup "kernel") | 5–6 GB | 1.8 GB | 0.5–0.6 GB |
+  | what could not be reclaimed, at most | 17.8 GB, killed at the cap | 15.0 GB | 13.1 GB |
+  | NVIDIA driver errors (`NVRM` lines; failed mapping inserts) | 14; 4 | 0 | 0 |
+
+  That is the 12–14 GB goal, for the first 20 minutes at least.
+- **Windows let go, and the slots that showed them.** When the title
+  maps a page into a window's range, the window's view of it is out of
+  date. Run 27 let a window go at every unmap under it: 2,544 in four
+  minutes. Descriptor slots written before then still showed the old
+  window: the memory line counted 68,178 looks at a slot that showed
+  another copy than the one brought up to date, against 6 and 9 in runs
+  24 and 25. Run 28 let a window go only when the title mapped a
+  different page (it never mapped the same one back: 0 of 8,721) and made
+  again the slots that showed a window let go (870,229 times). Those
+  looks still came to 62,903 in 20 minutes. Run 29 let a window go only
+  when the changed page lay where something had read through it (2,362
+  let go in 8 minutes, 11,786 only marked), and run 30 makes a slot again
+  as soon as the pass sees it shows another copy. Those looks still come
+  to about 3,000 a minute: about six windows go a second, each shown by
+  many slots, and each slot is now made again within a pass of being
+  seen. Whether any stays stale longer is not counted yet.
+- **The card's budget, and the PC's memory.** Victory stops making
+  copies of textures for the card at 90 % of the budget the system gives
+  it, but render targets and other copies the host writes are made
+  without a test, so the card ends at 98–100 %. Run 30's budget was larger
+  (other programs held less of the card), the card reached 99.8 %, and
+  vkd3d-proton put 2.4–3.9 GB of GPU data in the PC's memory instead (the
+  cgroup's "kernel" figure, 0.5 GB in run 28). That took the run to its
+  cap, and the driver's mapping errors came there.
+
+**The title's own watchdog (run 27).** At 0.1–0.2 frames a second the
+title's progress watchdog ends a run: a deliberate write to 0 at
+`+0x2215c35`, when one of its progress timestamps falls 300 behind. The
+hook that skips it is now ported (`VICTORY_NO_WATCHDOG=1`, from
+JMAN730/victory `87f33bd6` after #454; it patches only this build, after
+checking the bytes), and the `linux-nvidia` profile sets it. kc-run.sh's
+own watchdog still ends a run whose output stops.
+
+**Run 28 ended in the title's object pools.** At 16m43s the title stopped
+itself on a break (`+0x63966f`). Its crash report shows the same as run
+26's: one object pool full (45,000 of 45,000), another nearly (22,371 of
+22,500), and the streaming of the opening scene still not finished, with
+1,079 requests open. Run 28 had no driver errors at all, so the pools fill
+without a GPU stall. Streaming that would take seconds on a console does
+not finish here, while the title goes on loading the world around it. Why
+is open; it is the next thing to look at after memory.
+
+**Frames got slower.** Runs 27–28 drew at 0.1–0.2 frames a second, with
+frames of 5–20 s late in run 28, against about 1 s in run 24 with every
+pipeline made. Most of a long frame is the pass over textures shaders pick
+by index (13 s of 19.8 s, with 23,403 textures waiting), inside the pass
+over the view heap. Open.
 
 **Run 26 froze the desktop: a bug in NVIDIA's 620 driver.** Frames slowed
 from about 0.6 s to 3.5–5 s in its last minutes, nearly all of it in
