@@ -81,11 +81,21 @@ VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
   | depth twin converter (`twin.rs`) | ❌ `depth:17:19 E5005 'Load'` on `RWByteAddressBuffer` | no depth twins |
   | present compositor vs/ps (`host.rs`) | ✅ | none |
 
-  The other seven `D3DCompile` calls in victory-gpu are test-only. Options:
-  Microsoft's `d3dcompiler_47.dll` with `WINEDLLOVERRIDES=d3dcompiler_47=n,b`,
-  or one shared helper-compile path with DXC (after jman `dffc5924`, extended
-  to the twin converter). Run the probe again with whichever fix is chosen:
-  `umu-run Z:\...\victory_gpu-*.exe hlsl_probe --nocapture`.
+  The other seven `D3DCompile` calls in victory-gpu are test-only.
+
+  `winetricks d3dcompiler_47` is **not** a fix. It installs the Windows 8.1
+  SDK compiler (6.3.9600.16384, 2013), which predates Shader Model 5.1. With
+  `WINEDLLOVERRIDES=d3dcompiler_47=n,b` it refused all four with `X3506:
+  unrecognized compiler target 'cs_5_1'` (and `vs_5_1`, `ps_5_1`), so it
+  also breaks the compositor. A prefix that has had that verb run needs
+  `d3dcompiler_47` set back to `builtin`.
+
+  What remains: a Windows 10 or later `d3dcompiler_47.dll` (10.0.x), which
+  winetricks does not offer, or one shared helper-compile path with DXC
+  (after jman `dffc5924`, extended to the twin converter). Run the probe
+  again with whichever is chosen:
+  `umu-run Z:\...\victory_gpu-*.exe hlsl_probe --nocapture`, with
+  `WINEDEBUG=+loaddll` to see which compiler loaded.
 - This tree has no `VICTORY_DXC`. The indirect-argument clamp compiles with
   `D3DCompile` (`crates/victory-gpu/src/indirect.rs`), and only the validator
   path reads `VICTORY_DXIL`. jman's fork added `VICTORY_DXC` and embedded
