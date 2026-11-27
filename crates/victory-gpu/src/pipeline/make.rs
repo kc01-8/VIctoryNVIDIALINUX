@@ -496,11 +496,21 @@ fn next() -> Arc<Pending> {
 
 /// Starts the workers (the logical processors less 4, 4 to 14: 6 drained a
 /// cold library 35 % slower than 8 in run 353) on first use, at normal priority.
+///
+/// `VICTORY_PIPELINE_WORKERS=<n>` (1 to 32) sets the count instead. Each
+/// worker can hold a driver compile at once, and a compile of one of the
+/// title's largest shaders takes much memory: under Proton on a 32 GB
+/// machine, twelve at once took about 6 GB within seconds.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(4).clamp(4, 14));
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=32).contains(n))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(4).clamp(4, 14)));
+        tracing::info!(workers, "pipeline workers (VICTORY_PIPELINE_WORKERS)");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
