@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,11 @@ pub(crate) struct Pending {
     /// Whether the made pipeline has gone to a draw or dispatch yet
     /// (`crate::host::first_use`: for a device removal's report).
     handed: AtomicBool,
+    /// The thread making it now (0: none), and whether a thread that had
+    /// to wait for that has said so: when a title thread waits on a build
+    /// that never ends, the log names the thread to look for in a stack dump.
+    builder: AtomicU32,
+    waited: AtomicBool,
     /// The formats its state declares for what a draw draws into (zeros
     /// without a graphics state).
     pub(crate) formats: TargetFormats,
@@ -109,6 +114,8 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             handed: AtomicBool::new(false),
+            builder: AtomicU32::new(0),
+            waited: AtomicBool::new(false),
         }
     }
 
@@ -131,14 +138,29 @@ impl Pending {
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         self.made.get_or_init(|| {
+            let me = thread_id();
+            self.builder.store(me, Ordering::Relaxed);
+            let began = Instant::now();
             // A failed translation must complete this queue entry and wake its waiters.
-            match catch_unwind(AssertUnwindSafe(build)) {
+            let made = match catch_unwind(AssertUnwindSafe(build)) {
                 Ok(pipeline) => pipeline,
                 Err(_) => {
                     tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
                     None
                 }
+            };
+            let took = began.elapsed();
+            if took > Duration::from_secs(1) || self.waited.load(Ordering::Relaxed) {
+                tracing::info!(
+                    thread = me,
+                    ms = took.as_millis() as u64,
+                    made = made.is_some(),
+                    shaders = ?self.shaders,
+                    "host pipeline build finished (slow, or a thread waited for it)"
+                );
             }
+            self.builder.store(0, Ordering::Relaxed);
+            made
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,6 +224,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        let builder = p.builder.load(Ordering::Relaxed);
+        if builder != 0 && builder != thread_id() && !p.waited.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                thread = thread_id(),
+                builder,
+                shaders = ?p.shaders,
+                "a thread waits for a host pipeline another thread is making"
+            );
+        }
         start(p, REQUESTED);
         // A compute pipeline in the first 600 frames (the title's one-shot
         // world and lighting set-up passes) or with `compute_waits`: made
@@ -606,4 +637,10 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
     }
+}
+
+/// This thread's id, as stack dumps name threads.
+fn thread_id() -> u32 {
+    // SAFETY: a plain query.
+    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
 }
