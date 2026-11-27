@@ -49,6 +49,8 @@ mod heap_pass;
 pub mod framelog;
 #[cfg(windows)]
 mod heap_worker;
+#[cfg(all(test, windows))]
+mod hlsl_probe;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
