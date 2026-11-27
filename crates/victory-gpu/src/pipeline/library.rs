@@ -510,9 +510,25 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // An empty library is asked for with no blob (a null pointer), not
+        // an empty slice, whose pointer is never null: vkd3d-proton refuses
+        // a zero length with a pointer (E_INVALIDARG), so under Proton no
+        // library was made and nothing was kept or started early (kc/nvidia
+        // 742719b0).
+        let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); the out
+        // pointer is ours and holds a new reference on success.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                windows::core::Interface::as_raw(device),
+                blob,
+                bytes.len(),
+                &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
+                &mut raw,
+            )
+            .ok()?;
+            <ID3D12PipelineLibrary as windows::core::Interface>::from_raw(raw).cast()
         }
     };
     if !blob.bytes().is_empty() {
@@ -541,7 +557,13 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::warn!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
