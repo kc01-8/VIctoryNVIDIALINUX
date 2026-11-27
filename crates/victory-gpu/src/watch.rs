@@ -255,12 +255,60 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Ranges of pages (first, last) the kernel refused to answer about: not
+/// write-watched memory of one reservation. They are not asked about
+/// again until a mapping in them changes ([`title_memory_changed`]), or
+/// ten seconds have passed. Under Wine every such asking still took about
+/// 1.3 ms, and with the title's views kept in the books (soft views) all
+/// of them were refused: 258 a frame in kc/foxhound run 35, 325 ms of the
+/// threads' time a frame. A refused range goes to the guards, which is
+/// right for any memory, so a range kept here too long only costs that.
+static REFUSED: Mutex<(u64, BTreeMap<usize, usize>)> = Mutex::new((0, BTreeMap::new()));
+
+fn refused() -> std::sync::MutexGuard<'static, (u64, BTreeMap<usize, usize>)> {
+    let mut r = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    if now >= r.0 + 10_000 {
+        r.0 = now;
+        r.1.clear();
+    }
+    r
+}
+
+/// Whether `[first, last)` was refused already.
+fn was_refused(first: usize, last: usize) -> bool {
+    let r = refused();
+    r.1.range(..=first).next_back().is_some_and(|(&a, &b)| a <= first && last <= b)
+}
+
+/// `[first, last)` was refused.
+fn note_refused(first: usize, last: usize) {
+    refused().1.insert(first, last);
+}
+
+/// Mappings in pages `[first, last)` changed: refusals there are forgotten.
+fn forget_refused(first: usize, last: usize) {
+    let mut r = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if r.1.is_empty() {
+        return;
+    }
+    let gone: Vec<usize> = r.1.range(..last).filter(|&(_, &b)| b > first).map(|(&a, _)| a).collect();
+    for a in gone {
+        r.1.remove(&a);
+    }
+}
+
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if was_refused(first, last) {
+        #[cfg(feature = "diagnostics")]
+        tally(10, 1);
+        return None;
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -287,6 +335,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(11, started.elapsed().as_nanos() as u64);
         }
         if failed {
+            note_refused(first, last);
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -2906,6 +2955,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    forget_refused(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
