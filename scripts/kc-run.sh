@@ -2,11 +2,15 @@
 # One reproducible run of a title under Proton: a switch profile, a run
 # folder outside the checkout with what was run and what the machine did.
 #
-#   scripts/kc-run.sh [--profile NAME] [--dry] [--timeout SECONDS] TITLE.exe [-- victory run options]
+#   scripts/kc-run.sh [options] TITLE.exe [-- victory run options]
 #
 # --profile NAME  switches from profiles/NAME.env (default: default, which is empty)
 # --dry           map and bind only (no --execute)
 # --timeout S     stop the run after S seconds
+# --mem-max SIZE  run in a systemd user scope with MemoryMax=SIZE and no swap
+#                 (for example 18G): past it the kernel kills the run, not the desktop
+# --watchdog      kill the run on an NVRM Xid, when its processes use no CPU
+#                 for 45 s (a freeze), or when it prints nothing for 300 s
 #
 # The run folder is ~/.local/share/victory/runs/<UTC>-<sha>-<profile>/:
 # meta.txt, run.log (victory's output), gpu.csv (nvidia-smi dmon), mem.csv
@@ -23,12 +27,16 @@ root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 profile=default
 dry=0
 timeout_s=0
+mem_max=
+watchdog=0
 while (($#)); do
     case $1 in
         --profile) profile=${2:?--profile needs a name}; shift 2 ;;
         --dry) dry=1; shift ;;
         --timeout) timeout_s=${2:?--timeout needs seconds}; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        --mem-max) mem_max=${2:?--mem-max needs a size}; shift 2 ;;
+        --watchdog) watchdog=1; shift ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
         --) shift; break ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) break ;;
@@ -75,7 +83,7 @@ mkdir -p -- "$run"
     echo "commit    $(git -C "$root" rev-parse HEAD)$dirty"
     echo "branch    $(git -C "$root" rev-parse --abbrev-ref HEAD)"
     echo "profile   $profile ($(sha256sum "$profile_file" | cut -c1-16))"
-    echo "mode      $([[ $dry == 1 ]] && echo dry || echo execute)$([[ $timeout_s != 0 ]] && echo ", timeout ${timeout_s}s")"
+    echo "mode      $([[ $dry == 1 ]] && echo dry || echo execute)$([[ $timeout_s != 0 ]] && echo ", timeout ${timeout_s}s")$([[ -n $mem_max ]] && echo ", MemoryMax=$mem_max, no swap")$([[ $watchdog == 1 ]] && echo ", watchdog")"
     echo "kernel    $(uname -r)"
     echo "driver    $(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo unknown)"
     echo "memory    $(free -m | awk '/^Mem:/{print $2 " MiB total, " $7 " MiB available"}'); swap $(free -m | awk '/^Swap:/{print $3 "/" $2 " MiB used"}')"
@@ -103,6 +111,53 @@ stop() {
 }
 trap stop EXIT
 
+# The run's own cgroup, so it can be capped, measured and killed as a whole.
+unit=kc-run-$stamp
+runner=()
+if [[ -n $mem_max || $watchdog == 1 ]]; then
+    runner=(systemd-run --user --scope --quiet --unit="$unit" --collect)
+    [[ -n $mem_max ]] && runner+=(-p "MemoryMax=$mem_max" -p MemorySwapMax=0)
+    runner+=(--)
+fi
+cgroup() {
+    local p
+    p=$(systemctl --user show -P ControlGroup "$unit.scope" 2>/dev/null) || return 1
+    [[ -n $p ]] && printf '/sys/fs/cgroup%s' "$p"
+}
+kill_run() {
+    echo "watchdog  $1 at $(date -u +%T)" >> "$run/meta.txt"
+    echo "kc-run: watchdog: $1; killing the run" >&2
+    systemctl --user kill --signal=KILL "$unit.scope" 2>/dev/null || true
+}
+# Every 5 s: the cgroup's peak memory and OOM kills to mem-peak.txt, and
+# with --watchdog the three kill rules.
+monitor() {
+    local cg cpu last_cpu=-1 still=0 size last_size=-1 quiet=0
+    while :; do
+        sleep 5
+        cg=$(cgroup) || continue
+        [[ -d $cg ]] || continue
+        printf 'peak %s MiB, oom_kill %s\n' \
+            "$(( $(cat "$cg/memory.peak" 2>/dev/null || echo 0) >> 20 ))" \
+            "$(awk '/^oom_kill /{print $2}' "$cg/memory.events" 2>/dev/null)" > "$run/mem-peak.txt"
+        [[ $watchdog == 1 ]] || continue
+        if grep -q 'Xid' "$run/xid.log" 2>/dev/null; then
+            kill_run "NVRM Xid: $(grep -m1 Xid "$run/xid.log")"; return
+        fi
+        cpu=$(awk '/^usage_usec /{print $2}' "$cg/cpu.stat" 2>/dev/null || echo 0)
+        if (( cpu == last_cpu )); then still=$((still + 5)); else still=0; fi
+        last_cpu=$cpu
+        if (( still >= 45 )); then kill_run "no CPU time used for ${still}s (frozen)"; return; fi
+        size=$(stat -c %s "$run/run.log" 2>/dev/null || echo 0)
+        if (( size == last_size )); then quiet=$((quiet + 5)); else quiet=0; fi
+        last_size=$size
+        if (( quiet >= 300 )); then kill_run "no output for ${quiet}s"; return; fi
+    done
+}
+if ((${#runner[@]})); then
+    monitor & pids+=($!)
+fi
+
 args=("$title")
 [[ $dry == 1 ]] || args+=(--execute)
 args+=("$@")
@@ -110,17 +165,21 @@ echo "run folder: $run"
 status=0
 if [[ $timeout_s != 0 ]]; then
     timeout --signal=TERM --kill-after=20 "$timeout_s" \
-        "$root/scripts/victory-proton.sh" "${args[@]}" 2>&1 | tee "$run/run.log" || status=$?
+        "${runner[@]}" "$root/scripts/victory-proton.sh" "${args[@]}" 2>&1 | tee "$run/run.log" || status=$?
     # A timeout leaves Wine's processes behind.
     if (( status == 124 || status == 137 )); then
-        pkill -f 'victory\.exe' 2>/dev/null || true
-        WINEPREFIX=$WINEPREFIX/pfx wineserver -k 2>/dev/null || true
+        if ((${#runner[@]})); then
+            systemctl --user kill --signal=KILL "$unit.scope" 2>/dev/null || true
+        else
+            pkill -f 'victory\.exe' 2>/dev/null || true
+        fi
     fi
 else
-    "$root/scripts/victory-proton.sh" "${args[@]}" 2>&1 | tee "$run/run.log" || status=$?
+    "${runner[@]}" "$root/scripts/victory-proton.sh" "${args[@]}" 2>&1 | tee "$run/run.log" || status=$?
 fi
 crashes=$WINEPREFIX/pfx/drive_c/users/steamuser/AppData/Local/victory/data/crashes.log
 [[ -f $crashes ]] && cp -- "$crashes" "$run/crashes.log"
 echo "exit      $status" >> "$run/meta.txt"
+[[ -f $run/mem-peak.txt ]] && echo "memory    $(cat "$run/mem-peak.txt") (the run's cgroup)" >> "$run/meta.txt"
 echo "run folder: $run (exit $status)"
 exit "$status"
