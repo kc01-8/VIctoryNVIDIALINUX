@@ -105,9 +105,17 @@ fn most() -> u64 {
 /// then, in place now, of the windows: those over the page pool through
 /// views of our own ([`views_on`]) and their bytes; then, since the start,
 /// such windows the host refused, such windows kept when the title mapped
-/// again the pages they show, and such windows let go because it mapped
-/// other pages there.
-static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// again the pages they show, such windows let go because it mapped other
+/// pages where they had been read, such windows that went on with pages
+/// marked changed where nothing had read them yet, and such windows let go
+/// later because an ask reached a changed page.
+static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+
+/// Counts a window over the pool let go at an ask that reached one of its
+/// changed pages (`crate::shadow`).
+pub(crate) fn own_views_let_go_at_ask() {
+    STATS[14].fetch_add(1, Ordering::Relaxed);
+}
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -143,13 +151,18 @@ pub(crate) struct Placed {
 /// (`VK_EXT_external_memory_host`), and the probe says whether the driver
 /// takes it.
 ///
-/// When the title maps a page into a window's range again, the window is
-/// let go only if the page is another than the one it shows
-/// ([`title_memory_view`]); the next ask opens a new one. A page the title
+/// When the title maps another page than the one a window shows into its
+/// range ([`title_memory_view`]), the window is let go if that page lies
+/// in the part of it anything has read (`OwnViews::note_read`; an ask
+/// without a length reads to the window's end). Otherwise the page is
+/// only marked changed, and the window goes at the first ask that
+/// reaches a changed page; the next ask opens a new one. A page the title
 /// takes away and maps nothing in its place goes on showing what it
-/// showed: the title does not read memory it has not mapped. (Each
-/// streamed texture page is unmapped and mapped again: run 27 let go 2,544
-/// windows in four minutes when every unmap let them go.)
+/// showed: the title does not read memory it has not mapped. (Run 27 let
+/// go 2,544 windows in four minutes when every unmap did; run 28, with
+/// only a different page doing it, still 1,529 in four minutes, and not
+/// one remap mapped the same page back: a 4 MiB window covers streamed
+/// texture pages beside what is read through it.)
 ///
 /// shortcut: a descriptor slot written before a window was let go still
 /// shows the old one (the memory line counts slots that showed another
@@ -170,6 +183,10 @@ pub(crate) struct OwnViews {
     /// The title address of the first page, and what each page shows.
     at: u64,
     sources: Vec<Source>,
+    /// Pages the title has mapped another page at since (one bit each).
+    changed: Vec<AtomicU64>,
+    /// The lowest and highest title address read through the window.
+    read: [AtomicU64; 2],
 }
 
 /// What a page of an [`OwnViews`] shows: a section's handle and the byte
@@ -223,7 +240,15 @@ impl OwnViews {
             if base == 0 {
                 return None;
             }
-            let mut own = OwnViews { base, len, views: Vec::with_capacity(runs.len()), at: 0, sources: sources.to_vec() };
+            let mut own = OwnViews {
+                base,
+                len,
+                views: Vec::with_capacity(runs.len()),
+                at: 0,
+                sources: sources.to_vec(),
+                changed: (0..sources.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+                read: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
+            };
             for (i, &(page, pages, source)) in runs.iter().enumerate() {
                 let at = base + page * K64;
                 let bytes = pages * K64;
@@ -287,6 +312,40 @@ impl OwnViews {
             let here = (page * k64 - self.at) / k64;
             self.sources[here as usize] == Some((section, offset + (page * k64).saturating_sub(at)))
         }))
+    }
+
+    /// The window's pages that `[from, to)` covers, as indices.
+    fn pages(&self, from: u64, to: u64) -> std::ops::Range<usize> {
+        let k64 = K64 as u64;
+        let end = self.at + (self.sources.len() * K64) as u64;
+        let (from, to) = (from.max(self.at), to.min(end));
+        if from >= to {
+            return 0..0;
+        }
+        ((from - self.at) / k64) as usize..(to - self.at).div_ceil(k64) as usize
+    }
+
+    /// `[from, to)` was asked for through the window.
+    pub(crate) fn note_read(&self, from: u64, to: u64) {
+        self.read[0].fetch_min(from, Ordering::Relaxed);
+        self.read[1].fetch_max(to, Ordering::Relaxed);
+    }
+
+    /// Whether anything has read the part of the window `[from, to)` lies in.
+    pub(crate) fn was_read(&self, from: u64, to: u64) -> bool {
+        from < self.read[1].load(Ordering::Relaxed) && to > self.read[0].load(Ordering::Relaxed)
+    }
+
+    /// The title mapped other pages at `[from, to)`.
+    pub(crate) fn mark_changed(&self, from: u64, to: u64) {
+        for page in self.pages(from, to) {
+            self.changed[page / 64].fetch_or(1 << (page % 64), Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a page of `[from, to)` was mapped anew since.
+    pub(crate) fn changed_in(&self, from: u64, to: u64) -> bool {
+        self.pages(from, to).any(|page| self.changed[page / 64].load(Ordering::Relaxed) & (1 << (page % 64)) != 0)
     }
 
     fn unmap(&mut self) {
@@ -505,7 +564,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB ({} of them {} MB over the page pool through views of our own, VICTORY_INPLACE_VIEWS; {} such refused by the host, \
-         {} kept and {} let go when the title mapped pages there again), \
+         {} kept and {} let go when the title mapped pages there again, {} marked changed where nothing had read, {} let go at a later ask), \
          {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
@@ -515,6 +574,8 @@ fn say() {
         s[10],
         s[11],
         s[12],
+        s[13],
+        s[14],
         s[2],
         s[3] >> 20,
         s[4],
@@ -629,9 +690,10 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     crate::watch::views_mapped(section, offset, len);
     // Windows over the pool that showed other pages here go.
     if STATS[8].load(Ordering::Relaxed) != 0 {
-        let (kept, gone) = crate::shadow::own_views_mapped(at as u64, len as u64, section, offset);
+        let (kept, gone, marked) = crate::shadow::own_views_mapped(at as u64, len as u64, section, offset);
         STATS[11].fetch_add(kept, Ordering::Relaxed);
         STATS[12].fetch_add(gone, Ordering::Relaxed);
+        STATS[13].fetch_add(marked, Ordering::Relaxed);
     }
 }
 
@@ -1670,7 +1732,15 @@ mod tests {
     fn own_views_know_the_pages_they_show() {
         let k = K64 as u64;
         let at = 0x7_0000_0000u64;
-        let own = OwnViews { base: 0, len: 0, views: Vec::new(), at, sources: vec![Some((9, 4 * k)), Some((9, 7 * k)), None] };
+        let own = OwnViews {
+            base: 0,
+            len: 0,
+            views: Vec::new(),
+            at,
+            sources: vec![Some((9, 4 * k)), Some((9, 7 * k)), None],
+            changed: vec![AtomicU64::new(0)],
+            read: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
+        };
         assert_eq!(own.shows(at, k, 9, 4 * k), Some(true));
         assert_eq!(own.shows(at + k, k, 9, 7 * k), Some(true));
         assert_eq!(own.shows(at + k, k, 9, 5 * k), Some(false));
@@ -1682,6 +1752,15 @@ mod tests {
         assert_eq!(own.shows(at - k, k, 9, 0), None);
         // A view that begins before the window: its page there is offset on.
         assert_eq!(own.shows(at - k, 2 * k, 9, 3 * k), Some(true));
+        // Nothing read yet; a read of the first page; a page marked changed
+        // outside it, and an ask that reaches it.
+        assert!(!own.was_read(at, at + 3 * k));
+        own.note_read(at + 0x100, at + 0x200);
+        assert!(own.was_read(at, at + k) && !own.was_read(at + k, at + 2 * k));
+        own.mark_changed(at + 2 * k, at + 3 * k);
+        assert!(!own.changed_in(at, at + 2 * k));
+        assert!(own.changed_in(at + k + 0x10, at + 2 * k + 0x10));
+        assert!(!own.changed_in(at + 3 * k, at + 4 * k));
     }
 
     /// Views as the runtime tells them: a range inside one view, or over
