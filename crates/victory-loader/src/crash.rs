@@ -386,6 +386,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    // `VICTORY_STACKS_ON_CRASH=1` (diagnostics builds): every other thread's
+    // stack too, to see what a title that aborts itself was waiting on.
+    #[cfg(feature = "diagnostics")]
+    if std::env::var_os("VICTORY_STACKS_ON_CRASH").is_some_and(|v| v == "1") {
+        crate::stacks::dump_stacks();
+    }
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),
