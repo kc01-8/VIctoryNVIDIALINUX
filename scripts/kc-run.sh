@@ -18,7 +18,8 @@
 #
 # The run folder is ~/.local/share/victory/runs/<UTC>-<sha>-<profile>/:
 # meta.txt, run.log (victory's output), gpu.csv (nvidia-smi dmon), mem.csv
-# (free -m each second), xid.log (NVRM Xid lines from the kernel log, if it
+# (free -m each second), mem-cg.csv (with a scope: the run's own memory,
+# by kind, every 5 s), xid.log (NVRM Xid lines from the kernel log, if it
 # can be read), crashes.log (copied from the prefix after the run). These
 # hold what the title printed: they stay outside the checkout and are not
 # published (docs/asset-policy.md).
@@ -42,7 +43,7 @@ while (($#)); do
         --mem-max) mem_max=${2:?--mem-max needs a size}; shift 2 ;;
         --watchdog) watchdog=1; shift ;;
         --vkd3d) vkd3d=${2:?--vkd3d needs a folder}; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
         --) shift; break ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) break ;;
@@ -167,6 +168,12 @@ monitor() {
         printf 'peak %s MiB, oom_kill %s\n' \
             "$(( $(cat "$cg/memory.peak" 2>/dev/null || echo 0) >> 20 ))" \
             "$(awk '/^oom_kill /{print $2}' "$cg/memory.events" 2>/dev/null)" > "$run/mem-peak.txt"
+        # What the cgroup's memory is: anonymous, file cache, shared, kernel (MiB).
+        [[ -s $run/mem-cg.csv ]] || echo "time current anon file shmem kernel" > "$run/mem-cg.csv"
+        awk -v t="$(date -u +%T)" -v cur="$(cat "$cg/memory.current" 2>/dev/null || echo 0)" \
+            '$1 == "anon" || $1 == "file" || $1 == "shmem" || $1 == "kernel" {v[$1] = int($2 / 1048576)}
+             END {printf "%s %d %d %d %d %d\n", t, cur / 1048576, v["anon"], v["file"], v["shmem"], v["kernel"]}' \
+            "$cg/memory.stat" >> "$run/mem-cg.csv" 2>/dev/null || true
         [[ $watchdog == 1 ]] || continue
         if grep -q 'Xid' "$run/xid.log" 2>/dev/null; then
             kill_run "NVRM Xid: $(grep -m1 Xid "$run/xid.log")"; return
@@ -175,7 +182,9 @@ monitor() {
         if (( cpu == last_cpu )); then still=$((still + 5)); else still=0; fi
         last_cpu=$cpu
         if (( still >= 45 )); then kill_run "no CPU time used for ${still}s (frozen)"; return; fi
-        size=$(stat -c %s "$run/run.log" 2>/dev/null || echo 0)
+        # Output is run.log and victory.log together: under Proton
+        # Experimental victory's log goes only to victory.log (no console).
+        size=$(( $(stat -c %s "$run/run.log" 2>/dev/null || echo 0) + $(stat -c %s "$run/victory.log" 2>/dev/null || echo 0) ))
         if (( size == last_size )); then quiet=$((quiet + 5)); else quiet=0; fi
         last_size=$size
         if (( quiet >= 300 )); then kill_run "no output for ${quiet}s"; return; fi
