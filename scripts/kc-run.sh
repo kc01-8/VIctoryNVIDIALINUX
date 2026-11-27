@@ -78,11 +78,20 @@ if [[ -z ${VICTORY_DXC:-} && -n ${KC_DXC_DIR:-} ]]; then
 fi
 [[ -n ${VICTORY_DXC:-} ]] || echo "warning: VICTORY_DXC is not set; Wine's compiler refuses the helper shaders" >&2
 
-# The profile: KEY=value lines; comments and blank lines ignored.
-set -a
-# shellcheck source=/dev/null
-. "$profile_file"
-set +a
+# The profile: KEY=value lines; comments and blank lines ignored. A
+# variable already in the environment wins over the profile's line, so one
+# switch can be tried against a profile (`VICTORY_X=0 kc-run.sh --profile p`);
+# such overrides are listed in meta.txt.
+overrides=()
+while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    if [[ -n ${!key+set} ]]; then
+        [[ ${!key} != "$value" ]] && overrides+=("$key=${!key} (profile: $value)")
+        continue
+    fi
+    export "$key=$value"
+done < "$profile_file"
 
 sha=$(git -C "$root" rev-parse --short=8 HEAD)
 dirty=$(git -C "$root" status --porcelain --untracked-files=no | grep -q . && echo -dirty || true)
@@ -120,6 +129,11 @@ fi
     echo
     echo "## profile"
     grep -v -E '^\s*(#|$)' "$profile_file" || echo "(empty)"
+    if ((${#overrides[@]})); then
+        echo
+        echo "## overridden from the environment"
+        printf '%s\n' "${overrides[@]}"
+    fi
     echo
     echo "## git diff --stat"
     git -C "$root" diff --stat HEAD
