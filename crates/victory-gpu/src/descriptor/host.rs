@@ -4066,9 +4066,8 @@ impl HostHeap {
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
-    /// resource (diagnostics: a buffer view's slot must show the host copy
-    /// that is brought up to date for it).
-    #[cfg(feature = "diagnostics")]
+    /// resource (a buffer view's slot must show the host copy that is
+    /// brought up to date for it).
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let shown = self.kept_in(index)?;
         Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))

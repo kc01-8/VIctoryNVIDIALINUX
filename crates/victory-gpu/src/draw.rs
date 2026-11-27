@@ -1245,9 +1245,17 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
-        #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
+            #[cfg(feature = "diagnostics")]
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            // With windows over the pool in place, mostly a slot made on one
+            // that was let go since: made again now, from the copy its view
+            // finds (the one just found here).
+            if crate::inplace::views_on() {
+                host.remake_later(&[index]);
+                let _ = host.mirror(index, heap.handle(index)?, true);
+                HEAP_VIEWS_REMADE.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
         Some(((shadow, address, address + len), written))
