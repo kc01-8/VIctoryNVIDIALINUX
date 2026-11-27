@@ -5178,19 +5178,26 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// The title mapped the section's pages from `offset` on at `[at, at +
 /// len)`: windows over the pool in place there (`crate::inplace`, views of
 /// our own) that showed other pages are taken out of the tables, as
-/// [`in_place_let_go`] does. Returns how many were kept (they show those
-/// very pages) and how many went.
-pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -> (u64, u64) {
+/// [`in_place_let_go`] does, if anything read that part of them; the
+/// others have those pages marked changed, and go at the first ask that
+/// reaches one ([`loose`]). Returns how many were kept (they show those
+/// very pages), how many went, and how many had pages marked.
+pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -> (u64, u64, u64) {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
-    let mut kept = 0;
+    let (mut kept, mut marked) = (0, 0);
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let reach = IN_PLACE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
         let mut keys = Vec::new();
         for (key, shadow) in map.range((at.saturating_sub(reach), 0)..(end, 0)) {
-            match shadow.views.as_ref().and_then(|views| views.shows(at, len, section, offset)) {
-                Some(false) => keys.push(*key),
+            let Some(views) = shadow.views.as_ref() else { continue };
+            match views.shows(at, len, section, offset) {
+                Some(false) if views.was_read(at, end) => keys.push(*key),
+                Some(false) => {
+                    views.mark_changed(at, end);
+                    marked += 1;
+                }
                 Some(true) => kept += 1,
                 None => {}
             }
@@ -5202,7 +5209,7 @@ pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -
     for shadow in gone {
         crate::host::retire(shadow);
     }
-    (kept, n)
+    (kept, n, marked)
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -5609,11 +5616,26 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         if unsized_ask {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(views) = shadow.views.as_ref() {
+            views.note_read(address, reads_end(shadow, unsized_ask, address, end));
+        }
     };
+    // What an ask reads of a window: an ask without a length reads to the
+    // window's end.
+    fn reads_end(shadow: &Shadow, unsized_ask: bool, address: u64, end: u64) -> u64 {
+        if unsized_ask { shadow.start + shadow.len } else { end.max(address + 1) }
+    }
+    let reads_to = |shadow: &Shadow| reads_end(shadow, unsized_ask, address, end);
+    // A window over the pool in place whose pages the title mapped anew
+    // where this ask reads (`crate::inplace`, views of our own): it goes,
+    // and a new one is opened below.
+    let stale = |shadow: &Shadow| shadow.views.as_ref().is_some_and(|views| views.changed_in(address, reads_to(shadow)));
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        if let Some(shadow) = map.get(&named)
+            && !stale(shadow)
+        {
             note(shadow);
             return Some(shadow.clone());
         }
@@ -5631,6 +5653,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     } else {
         named
     };
+    if map.get(&(start, len)).is_some_and(|shadow| stale(shadow))
+        && let Some(shadow) = map.remove(&(start, len))
+    {
+        crate::inplace::own_views_let_go_at_ask();
+        mark_gone(std::slice::from_ref(&shadow));
+        crate::host::retire(shadow);
+    }
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
