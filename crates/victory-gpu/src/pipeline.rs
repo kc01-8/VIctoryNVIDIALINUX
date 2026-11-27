@@ -146,7 +146,7 @@ pub(crate) struct Translated {
 /// victory.exe+...", `___chkstk_ms`). Address space only; pages are used as
 /// the stack grows.
 #[cfg(windows)]
-const TRANSLATE_STACK: usize = 64 << 20;
+pub(super) const TRANSLATE_STACK: usize = 64 << 20;
 
 /// [`translate`] on a thread of its own with [`TRANSLATE_STACK`], whatever
 /// thread asks; on that thread directly if one cannot be made.

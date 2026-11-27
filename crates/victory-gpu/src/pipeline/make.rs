@@ -239,7 +239,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         // here, or waited for while a worker makes it, instead of dropping
         // its dispatch after the frame's budget. `make` keeps its panic guard.
         if p.graphics.is_none() && (compute_waits() || crate::frame::current() < 600) {
-            p.make();
+            on_own_stack(|| p.make());
         } else {
             wait(p, crate::frame::current());
         }
@@ -471,7 +471,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
-            p.make();
+            on_own_stack(|| p.make());
         }
         return;
     }
@@ -643,4 +643,40 @@ mod tests {
 fn thread_id() -> u32 {
     // SAFETY: a plain query.
     unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// Runs `f` (a pipeline's build) on a thread of its own with
+/// [`super::TRANSLATE_STACK`], and on this thread if none can be made. A
+/// build asked for on a title thread (1 MiB of stack) overflowed it under
+/// Proton (the driver's compile through vkd3d-proton runs on the calling
+/// thread): the thread ended without unwinding, its pipeline stayed "being
+/// made", and every later thread that needed it waited until the title
+/// aborted itself.
+fn on_own_stack(f: impl FnOnce() + Send) {
+    // Taken by whichever runs it: the new thread, or this one if none.
+    let f = Mutex::new(Some(f));
+    let take = || f.lock().unwrap_or_else(|e| e.into_inner()).take();
+    std::thread::scope(|s| {
+        let spawned = std::thread::Builder::new()
+            .name("victory-build".into())
+            .stack_size(super::TRANSLATE_STACK)
+            .spawn_scoped(s, || {
+                if let Some(f) = take() {
+                    f();
+                }
+            });
+        match spawned {
+            Ok(thread) => {
+                if let Err(panic) = thread.join() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread for a pipeline build: it runs on the asking thread");
+                if let Some(f) = take() {
+                    f();
+                }
+            }
+        }
+    });
 }
