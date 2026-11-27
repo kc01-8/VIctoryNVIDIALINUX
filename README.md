@@ -12,14 +12,14 @@ with vkd3d-proton turning its Direct3D 12 into Vulkan.
 You need your own copy of the game. It is not affiliated with or endorsed by
 the game's developer or publisher, or by Microsoft.
 
-## Status (2026-11-26)
+## Status (2026-11-27)
 
 | | |
 |---|---|
 | Cross-building `victory.exe` on Linux | ✅ works |
 | Launcher, smoke and loader tests under Proton (no game files) | ✅ pass |
 | The GPU helper shaders under Proton (indirect draws, masked patch, card compare, card fetch) | ✅ compiled with DXC, because Wine's own compiler refuses them; their tests pass on an RTX 3080 Ti |
-| Running a title under Proton | ⚠️ boots to the menus and loads, then the title stops itself after about 3 minutes (being traced). Needs Proton Experimental: UMU-Proton 11.0-2e crashes the driver |
+| Running a title under Proton | ⚠️ boots, loads and draws the first scenes (thousands of draws a frame, under 1 fps while its pipelines are first built), then runs out of memory under an 18 GB cap. Needs Proton Experimental **and vkd3d-proton built from master** (below): the vkd3d-proton in current Proton releases crashes on some of the title's shaders |
 | Performance measurements on Linux | none yet |
 
 The details, with the commands that produced them, are in
@@ -46,6 +46,30 @@ as the work moves on.
   with `PROTONPATH`. UMU-Proton 11.0-2e's vkd3d-proton turns two of the
   title's compute shaders into invalid SPIR-V, and NVIDIA's driver crashes
   on it (the window just closes); Experimental's does not.
+- **vkd3d-proton from master**, until a Proton release carries it. The
+  shader converter inside Proton Experimental 2026-11-12 (dxil-spirv from
+  2026-11-11) recurses forever on some of the title's largest shaders, and
+  the title stops a little later. dxil-spirv fixed this on 2026-11-25. Build
+  vkd3d-proton (needs meson, ninja, glslang, mingw-w64 and its `widl`):
+
+  ```sh
+  git clone --recursive https://github.com/HansKristian-Work/vkd3d-proton
+  cd vkd3d-proton
+  meson setup --cross-file build-win64.txt --buildtype release build.64
+  ninja -C build.64
+  ```
+
+  and put `build.64/libs/d3d12/d3d12.dll` and
+  `build.64/libs/d3d12core/d3d12core.dll` beside `victory.exe` (Wine loads
+  DLLs from the executable's folder first), or pass their folder to
+  `kc-run.sh --vkd3d`. The Proton log (`PROTON_LOG=1`) names the build that
+  loaded.
+- **Memory.** On Windows the title takes about 23–27 GB of a 32 GB PC while
+  playing (hyphennn's figures), and it needs as much here. A 12 GB card
+  fills to its 10.2 GB budget, and the rest of the GPU's data goes to system
+  memory (6 GB in run 24). That counts against a memory cap, so an 18 GB
+  cap is too small. The first build of its pipelines also takes several
+  GB at once: `VICTORY_PIPELINE_WORKERS=4` builds fewer at a time.
 - **DXC**, Microsoft's open-source shader compiler: `dxcompiler.dll` and
   `dxil.dll` from `bin/x64` of a
   [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases).
@@ -88,6 +112,7 @@ export VICTORY_DXC=/path/to/dxc                                     # the folder
 export PROTONPATH="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
 export WINEPREFIX="$HOME/.local/share/victory/proton-exp"           # its own prefix
 export VICTORY_WAVE_WIDE=last                                       # NVIDIA's 32-lane waves
+export VICTORY_PIPELINE_WORKERS=4 VICTORY_PIPELINE_COMPUTE_WAIT=0   # see "Memory" above; the status doc
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe"            # map and bind only
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe" --execute  # run it
 ```
@@ -117,8 +142,8 @@ export VICTORY_WAVE_WIDE=last                                       # NVIDIA's 3
   readings, the crash log).
 
 The launcher converts a Linux `VICTORY_DXC` path to the `Z:` path that
-Wine needs. Runs so far reach the menus and loading but do not last (see
-the status table), so treat a run as a test, not a way to play.
+Wine needs. Runs so far reach the first scenes but do not last (see the
+status table), so treat a run as a test, not a way to play.
 
 ## Development
 

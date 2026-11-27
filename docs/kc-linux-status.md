@@ -83,15 +83,21 @@ VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
 ## Title runs under Proton (2026-11-27)
 
 RTX 3080 Ti (12 GB, driver 620.73.04), 32 GB RAM, `scripts/kc-run.sh
---mem-max 18G --watchdog`, HUD off. Every run maps the title and binds all
-imports (`missing=0`) and reaches the menus. Memory peaked at 4–13 GB of
-the 18 GB cap; no out-of-memory kill, no NVRM Xid.
+--mem-max 18G --watchdog`, HUD off, diagnostics build from run 14 on, Enter
+pressed once 18 s in (`VICTORY_KEYS=18:Enter`) from run 20 on. Every run
+maps the title, binds all imports (`missing=0`) and reaches the menus. No
+NVRM Xid in any run.
 
 | Runs | Proton | What ended them |
 |---|---|---|
 | 3, 5, 6 | UMU-Proton 11.0-2e | NVIDIA's driver crashed inside `vkCreateComputePipelines` ("Exception 0xc0000005 / 0xc000001d in Unix call"), and Wine ended the process (exit 3, reported as 247): compute shaders `4e296b1885c37b29`, then `8bb272e763f76148` |
 | 7, 8 | UMU-Proton 11.0-2e, both denied (`VICTORY_DENY_PIPELINES`) | no driver crash; the title stopped drawing and its own watchdog aborted it about 30 s later (its deliberate write to 0, `+0x23cf683`; see upstream `ff8694a6`) |
 | 10, 11 | Proton Experimental 2026-11-12 | no driver crash; the same abort about 3 minutes in, while loading. In run 11, `02384a60fda6f2d0` and `369cbe906ea72764` were refused just before (below) |
+| 12–19 | Proton Experimental 2026-11-12 | the same abort: a pipeline build overflowed its thread's stack, first on 1–2 MiB stacks, then on 64 MiB inside vkd3d-proton's shader converter (below) |
+| 20, 21 | Experimental + vkd3d-proton master | no crash; frames stop at the first big load while the title waits for compute pipelines being made, and the watchdog fires (below) |
+| 22 | as 20, the pipeline library fixed, `VICTORY_PIPELINE_COMPUTE_WAIT=0` | through the load into the first 3D scenes (up to 6,000 draws a frame, under 1 fps); killed by the kernel at the 18 GB cap 3m30s in, with 12 pipeline workers |
+| 23 | as 22, `VICTORY_PIPELINE_WORKERS=4`, the library from run 22 | in the 3D scenes 2m25s in and still drawing (0.2–0.5 fps, peak 15.9 GB) when `kc-run.sh`'s own watchdog killed it at 5 min: it watched `run.log`, which stops growing once the log goes to `victory.log` (fixed) |
+| 24 | as 23, the watchdog fixed | every known pipeline made 1m20s in, before the load; in the 3D scenes from 2 min at 0.1–0.8 fps, at the 18 GB cap from about 2m20s; still running at 8 min (below) |
 
 **The driver crash, reproduced outside the title.** The saved shaders
 (`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
@@ -110,20 +116,129 @@ group of 128, the mask as data, `v_mbcnt`, `v_readlane`). hyphennn's
 Windows runs on an RTX 4070 refused both too and went on, so these alone
 may not be what stops the title here.
 
-**Open: the abort.** It comes after about 30 s in which the process is
-nearly idle (0.1–0.2 of 16 cores) and nothing is presented. In runs 11–14
-it began within a second of a compute pipeline being refused or skipped.
+**The abort, runs 14–19: a dead build thread.** The title aborts itself
+about 30 s after its frames stop (its deliberate write to 0 at
+`+0x23cf683`). In runs 14–19 (and probably 11–13, which had no stack
+dump) the frames stopped because a thread building a pipeline died: Wine logged `virtual_setup_exception stack overflow`, the
+thread ended without unwinding, the pipeline's `OnceLock` stayed "being
+made", and the next title thread that needed it waited forever (run 14's
+stuck `OnceLock`, with no thread making it). Translation and builds first
+ran on the asking title thread's 1 MiB stack, then on a worker's 2 MiB.
+They now get 64 MiB of their own (`b1045749`, `1db4855f`, `7fce94b4`).
+With 64 MiB the same shaders still overflowed: `fdd56d97a806bcca` (runs
+17, 18), then `a1b20bc47e3c9597` (run 19, with the first denied through
+`VICTORY_DENY_PIPELINES`). The recursion was not victory's.
 
-Run 14 (diagnostics build, `VICTORY_STACKS_ON_CRASH=1`, stacks named with
-`scripts/kc-symbolize.sh`): a title thread recording a dispatch
-(`list::state::dispatch` → `draw::State::dispatch_x` →
-`pipeline::make::ready`) waits in the pipeline's `OnceLock` for its build,
-and no thread is making it: all 12 pipeline workers wait for work, no
-other thread is in `HostPipeline::new`, no panic or other exception was
-logged. Ruled out: a lost wakeup in Wine's `WaitOnAddress` (100,000 rounds
-of racing `OnceLock` waiters under both Protons, none stuck) and a dead
-worker. The build's thread is now logged when another thread waits for it
-(`a7267ff7`); the next run says which thread to look at.
+**It was vkd3d-proton's shader converter.** Built from source on Linux, the
+dxil-spirv command-line tool reproduces it on the DXIL victory hands
+vkd3d-proton (saved with `VICTORY_SHADER_SAVE`, outside the checkout):
+
+| dxil-spirv | Shipped in | `fdd56d97a806bcca` | `a1b20bc47e3c9597` |
+|---|---|---|---|
+| `114e664e` (2026-11-11) | vkd3d-proton `2576c0b4`, Proton Experimental 2026-11-12 | crash: stack overflow, 64 MiB | crash |
+| `b540c8a2` (2026-11-25) | vkd3d-proton master `71cae091` | 207 KB of SPIR-V in 22 ms, `spirv-val` passes | converted |
+
+In `114e664e`, `LoopMergeTracer::trace_from_parent` marks a block visited
+only after visiting it, so two loop headers that reach each other recurse
+until the stack runs out: 838,609 frames in 64 MiB. Upstream removed that
+code with the legacy structurizer (`3bc8276`), and rewrote its other
+recursive walks for very large shaders (pull request #371). The title's
+shaders are very large: many are 100–300 KB of DXIL and become 0.5–1 MB of
+SPIR-V.
+
+Until a Proton release carries a dxil-spirv from 2026-11-25 or later, build
+vkd3d-proton master (README) and give the run its two DLLs:
+`kc-run.sh --vkd3d DIR` copies them beside the run's own link to
+victory.exe, and Wine loads DLLs from the executable's folder first. The
+Proton log names the build that loaded (`vkd3d-proton - build: 71cae091…`).
+
+**Runs 20–21 (vkd3d-proton master): both shaders build, and the title stops
+at the first big load.** There was no crash and no overflow. About 1m50s
+in, the frames stopped and the watchdog fired 30 s later. Two title
+threads were recording dispatches whose compute pipelines are made before
+the dispatch goes on (`VICTORY_PIPELINE_COMPUTE_WAIT`, on by default).
+Hundreds of new pipelines were being made at once, 1–2 s each for compute
+and up to 11 s for some mesh pipelines. They were nearly as slow in run 21
+as in run 20, so the driver's cache did not help these. Run 20 also
+reached the 18 GB cap (VRAM 11.5 of 12 GB).
+
+**Victory's pipeline library never worked under Proton.** Victory asked
+for an empty `ID3D12PipelineLibrary` with an empty slice, whose pointer is
+never null, and vkd3d-proton refuses a zero length with a pointer
+(`E_INVALIDARG`). Windows accepts it. So under Proton no library was made,
+no pipeline was kept, and the list of pipelines to start early on the next
+launch was never written. The empty library is now asked for with a null
+pointer, and each pipeline's name and host time are logged
+(`host pipeline made …`, `… loaded from the library`).
+
+**Runs 22–24: the first scenes, then memory.** With the library fixed and
+`VICTORY_PIPELINE_COMPUTE_WAIT=0`, a dispatch whose compute pipeline isn't
+made yet is dropped after the frame's 500 ms budget, as draws are, instead
+of waited for. The picture can be wrong until that pass runs again. The
+title then draws through the load into its first 3D scenes: 2,000–6,500
+draws a frame at 0.2–0.5 fps while hundreds of pipelines are still being
+made. Most of a frame goes to preparing textures (4.2 s of 5.2 s in one
+frame of run 23); the GPU's own work is about 0.3 s.
+
+- **Workers and memory.** With 12 pipeline workers, the PC's free memory
+  fell by about 6 GB within seconds of the builds starting, and the kernel
+  killed run 22 at the 18 GB cap. With 4 (`VICTORY_PIPELINE_WORKERS=4`),
+  run 23 held at 15.5–15.9 GB.
+- **What the memory is.** In run 23 the process held 7.0 GB of NVIDIA
+  driver memory, mapped through `/dev/nvidiactl`: upload and read-back
+  heaps, and what no longer fits the card, which was full at 11.9 of 12 GB.
+  It also held 5.2 GB of Wine mappings (the title's memory) and 4.7 GB of
+  heap.
+- **The cap is too low.** hyphennn's Windows runs take 23–27 GB of a 32 GB
+  PC, plus 9.2–9.6 GB of the card, while playing. An 18 GB cap is below
+  what the title needs.
+- **The second run is faster, not instant.** Run 23 loaded run 22's library
+  and started 1,621 pipelines early. The 33 pipelines that took over 1 s in
+  run 22 (189 s together) took 82 s together in run 23. A known pipeline
+  builds faster the second time, but not at cache speed. Offline, the
+  driver's cache makes a second build almost free, so why in-game builds
+  miss it is still open.
+
+**Run 24 (as run 23, the watchdog fixed): the card overflows into the
+PC's memory.** The library and the early list from runs 22–23 had every
+pipeline built 1m20s in, before the load. The 3D scenes followed at
+2 minutes, at 0.1–0.4 fps with no pipeline left to make. Then the run sat
+at the 18 GB cap, the kernel taking back file cache to keep it going.
+
+- **The card was full.** Its own memory stood at its 10.2 GB budget, and
+  6 GB more of GPU data was in the PC's memory, which vkd3d-proton offers
+  the title as a 24 GB "shared" budget.
+- **The cap's unreclaimable part grew.** It reached about 17.3 GB: 5.2 GB
+  of heap, 6.7 GB of shared memory (the title's memory, Wine's
+  `memfd:wine-mapping`) and 5.3 GB the cgroup counts as kernel memory.
+- **Only 136 MiB of that "kernel" memory is the kernel's own.** Its stacks,
+  page tables and slab come to 136 MiB, so the rest is memory charged by a
+  driver: the GPU's data in the PC's memory. It grew about 1.2 GB a minute
+  as the title streamed its world in.
+- **The fix is more memory, not a fix in victory.** The title's own needs
+  are what fill the cap. A cap near what the title takes on Windows (23–27
+  GB of 32) is needed, or the title kept from using so much of the card.
+
+**First performance notes (run 24, all pipelines made).** A frame took
+about 1 s, and the card was idle for 0.9 s of it; the time goes to the CPU
+side (victory's frame log):
+
+| Per frame | ms |
+|---|---|
+| Remapping title memory (453 calls) | 507 |
+| … of which Wine's unmapping of views | 356 (about 0.8 ms a call) |
+| … of which Wine's mapping of views | 93 |
+| Copying title memory up to the card (144 MB) | 520 |
+| Copying back (36 MB) | 200 |
+| Refreshing textures (mostly waiting for memory to hold still) | 226 |
+| The card's own work | about 170 |
+
+The title remaps a page of its memory for each streamed texture page
+(hyphennn's analysis: `CopyPageMappingsBatchX` → `xmem::map_alias`, a view
+taken away and one mapped each time). On Windows hyphennn measured about
+850 remaps and 140–246 ms in a streaming frame, so 0.2–0.3 ms each. Here
+they are about 1.1 ms each, 4–6 times as slow. That makes remapping the
+first thing to look at for speed under Proton.
 
 **Runs need no network.** The title's crash handler tried to upload its
 report; victory blocked it (`HTTP connection blocked`).
