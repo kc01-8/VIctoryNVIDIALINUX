@@ -498,7 +498,40 @@ fn split_late() -> bool {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section of physical pages: its handle, its bytes, and under Wine a
+/// view of the whole of it that DirectStorage writes go through
+/// ([`Section::whole`]).
+struct Section(HANDLE, usize, std::sync::OnceLock<usize>);
+
+impl Section {
+    /// Under Wine, the address of a view of the whole section, mapped at
+    /// the first ask and kept while the section lives; `None` elsewhere or
+    /// if it could not be mapped.
+    ///
+    /// A disk write into physical pages took a view of its own each time
+    /// (`View::map`): a map, a commit and an unmap. Under Wine those wait
+    /// their turn behind the title's own mapping calls, 1,500-2,000 a
+    /// frame there: run 31 logged 899 such views costing 39.2 s of the
+    /// sixteen workers' time in one frame, 43 ms each, while the opening
+    /// scene's streaming waited on them. The section is committed whole
+    /// there (`commit`), so one view of it needs nothing more.
+    fn whole(&self) -> Option<usize> {
+        if !on_wine() {
+            return None;
+        }
+        let at = *self.2.get_or_init(|| {
+            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+            // SAFETY: our own section, whole; the view is ours until the
+            // section goes (`Drop`).
+            let view = unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, self.1) };
+            if view.Value.is_null() {
+                tracing::warn!(bytes = self.1, error = %std::io::Error::last_os_error(), "no view of a whole section of physical pages: disk writes map their own");
+            }
+            view.Value as usize
+        });
+        (at != 0).then_some(at)
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -507,6 +540,14 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(&at) = self.2.get()
+            && at != 0
+        {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: the whole section's view of ours (`whole`), which
+            // nothing borrows any more (every `View` holds the section).
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -600,7 +641,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, size, std::sync::OnceLock::new()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -636,10 +677,13 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 }
 
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
+/// writable, unmapped when dropped; or under Wine a part of the whole
+/// section's view (`Section::whole`), which stays.
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// The section, while a part of its whole view is borrowed.
+    whole: Option<Arc<Section>>,
 }
 
 impl View {
@@ -647,6 +691,14 @@ impl View {
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        if let Some(base) = slice.section.whole() {
+            victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViews, 1);
+            return Some(View {
+                at: MEMORY_MAPPED_VIEW_ADDRESS { Value: (base + offset as usize) as *mut c_void },
+                len,
+                whole: Some(slice.section.clone()),
+            });
+        }
         // For the frame log: these views take their turn in the kernel
         // beside the title's own mapping calls.
         let started = std::time::Instant::now();
@@ -663,7 +715,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, whole: None };
         let committed = commit(at.Value as usize, len);
         victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViews, 1);
         victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViewUs, started.elapsed().as_micros() as u64);
@@ -680,6 +732,9 @@ impl View {
 
 impl Drop for View {
     fn drop(&mut self) {
+        if self.whole.is_some() {
+            return;
+        }
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         let started = std::time::Instant::now();
         // SAFETY: our view.
