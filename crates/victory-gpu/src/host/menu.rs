@@ -53,7 +53,7 @@ const ABOUT_PRELOAD: [&str; 3] = [
 const MFG: &str = "VICTORY_MFG_UNLOCKER";
 const ABOUT_MFG: [&str; 3] = [
     "A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.",
-    "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
+    "ON: LOADED AT THE NEXT START, ONCE ITS DLL IS IN PLACE.",
     "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
 ];
 /// The note after the first Enter on it: the second one does it.
@@ -84,7 +84,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
     Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
-    // Someone else's mod (apps\victory\src\play.rs): downloaded at the next start, then loaded.
+    // Someone else's mod (apps\victory\src\play.rs): loaded at the next start if its DLL is in place.
     Item { var: MFG, label: "MFG UNLOCKER (MOD, RTX 20/30)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },

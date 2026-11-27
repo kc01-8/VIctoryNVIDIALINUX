@@ -1,374 +1,234 @@
-# VIctory on NVIDIA
+# **NO COPYRIGHTED CONTENT PERMITTED. 100% CORRECTLY LICENSED CODE ONLY.**
 
-> **Reporting a problem?** Please attach **both** logs from the run that went
-> wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address
-> bar of File Explorer to get there.
->
-> 1. **The play log**, in `%LOCALAPPDATA%\victory\logs\`: the newest
->    `victory-nvidia-play-<date>-<time>-<number>.log` (from `victory.exe`) or
->    `victory-nvidia-<date>-<time>.log` (from the script launcher). The window
->    shows its path at the start, on the line `Log: ...`.
-> 2. **The crash log**: `%LOCALAPPDATA%\VIctory\data\7952987A\crashes.log`, and,
->    if there is one from that run, the newest `victory-<date>-<time>-<number>.crash.log`
->    in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
->
-> Also say which GPU, Windows version (10 or 11) and release you used.
+## **ALL IN ACCORDANCE WITH THE LICENSES OF THE FORKED PROJECTS: GPL-3.0-OR-LATER ([VIctory](https://github.com/Marvisak/VIctory), [fxceless/victory-fork](https://github.com/fxceless/victory-fork), [JMAN730/victory](https://github.com/JMAN730/victory), [foxhound](https://github.com/readmet3xt-lab/foxhound), [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)).**
 
-## Frame generation: what your card supports
+## **NO PULL REQUESTS WILL BE ACCEPTED WHICH DO NOT STRICTLY COMPLY WITH THESE LICENSES.**
 
-| Your card | Frame generation | Limits |
-| --- | --- | --- |
-| GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
-| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
-| Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
+---
 
-- **At every start the game tells you** which one your card runs, and why
-  not if it can't, at the top of the picture for the first 30 seconds (and
-  in the console window).
-- **F1 menu, FRAME GEN TYPE**: AUTO (DLSS where the card has it, else FSR 3),
-  DLSS, or FSR 3 (also on an RTX 40/50, if you prefer it). FRAME GENERATION
-  switches it off or on.
-- FSR 3 needs AMD's FidelityFX DLLs (`amd_fidelityfx_loader_dx12.dll` and
-  `amd_fidelityfx_framegeneration_dx12.dll`, about 30 MB). They are AMD's and
-  not part of this program. On a card without DLSS frame generation (or with
-  FSR 3 chosen in F1) the first start of `victory.exe` asks once whether to
-  download them from AMD's own GitHub (the FidelityFX SDK);
-  `victory.exe get-fsr` does it later, and `Get-AMD-FSR.cmd` does it for the
-  script launcher. Each file is checked against the copy this fork was tested
-  with, and only loaded with AMD's valid signature. A `fidelityfx` folder next
-  to `victory.exe`, or `VICTORY_FIDELITYFX_DIR`, works too.
+# VIctoryNVIDIALINUX: the foxhound base
 
-## Quick start: how to run it
+This branch, `kc/foxhound`, is
+[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)
+(on [readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)),
+the fastest VIctory tree on NVIDIA cards under Windows, with this fork's
+work for **x86-64 Linux under Proton** carried onto it. VIctory is the
+compatibility layer that runs an Xbox Series title on a PC from files you
+supply.
 
-**The easy way: one file, nothing to build**
+`victory.exe` stays a Windows program. On Linux it runs under Proton
+(through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)),
+with vkd3d-proton turning its Direct3D 12 into Vulkan.
 
-1. Download `victory.exe` from the
-   [latest release](https://github.com/trustno1-coder/VIctory-NVIDIA/releases/latest).
-2. Put it into the folder of **your own dump** of the title's Xbox Series
-   build v1.0.2.1, next to `game_scarlett_master.exe`.
-3. Double-click it. Windows may say the publisher is unknown (the file is not
-   signed): "More info", then "Run anyway".
+**This repository contains no game files, code or assets, and never will.**
+You need your own copy of the game. It is not affiliated with or endorsed by
+the game's developer or publisher, or by Microsoft.
 
-- The first start asks once whether to download NVIDIA's DLSS and frame
-  generation files (about 70 MB) from NVIDIA's own GitHub. They are NVIDIA's
-  and are not part of this program; say no and the game still runs, with its
-  own upscaling and no frame generation.
-- Settings, saves, caches, logs and NVIDIA's and AMD's files are kept under
-  `%LOCALAPPDATA%\victory`. The one exception is on Windows 10. Its own Direct3D 12
-  stops at shader model 6.5, and the game's translated shaders need 6.6. Without
-  6.6 the game shows a black screen and closes within seconds. So the first start
-  there offers to fetch Microsoft's newer Direct3D 12 runtime (the D3D12 Agility
-  SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
-  folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
-  The file is checked against Microsoft's signature and the tested SHA-256.
-  Windows 11 keeps using its own runtime.
-- You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
-  GeForce RTX card with a recent driver. This repository and its releases
-  contain no game files.
-- **The first start of each new version restarts by itself once.** A new
-  `victory.exe` runs at about 14 fps on its first start, and normally from then
-  on. So the first start plays about 20 seconds, says so at the top of the
-  picture, and starts the game again. It doesn't happen again for that version
-  (a mark is kept in `%LOCALAPPDATA%\victory\warmed`).
-- RTX 20 and 30 cards can try DLSS frame generation with the
-  [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) mod (not ours, and
-  not tested with this fork, which was only run on an RTX 50). It is an option,
-  off by default: **F1, MFG UNLOCKER, ON**, then restart. On, the next start
-  downloads it by itself from the mod's own GitHub release (v1.7.2, about 5 MB,
-  checked against the SHA-256 its author published) into
-  `%LOCALAPPDATA%\victory\mfg-unlocker`, and every start loads it. Nothing is
-  renamed or copied. On an RTX 20 or 30 the first start also asks once (No unless
-  you type y). `victory.exe get-mfg` downloads it by hand. The mod writes its own
-  `RTXMFG-...` logs and settings beside `victory.exe`, and Backspace opens its
-  menu. The start's notice says "UNLOCKED BY A MOD" and the log says it was
-  loaded. If the game crashes or frame generation fails, turn it off in F1 (or
-  add `VICTORY_MFG_UNLOCKER=` to `%LOCALAPPDATA%\victory\victory-settings.txt`).
-  FSR 3 frame generation (2x) is the supported way on those cards. A
-  `winmm.dll` copy of the mod beside `victory.exe` still works too.
+**This build downloads nothing.** trustno1's launcher fetched NVIDIA's DLSS
+and frame generation files, AMD's FSR 3 files, Microsoft's Direct3D 12
+runtime and a third-party mod; here those commands say where to put the
+files and stop. Supply them yourself if you want them.
 
-**In the game**
-
-- **F1** brings up the settings menu (arrow keys pick and change, Enter does
-  it): DLSS, frame generation, frame rate cap and more.
-- **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
-  memory numbers).
-
-**Building it yourself instead**
-
-Install [Rust](https://rustup.rs) and the
-[Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-with "Desktop development with C++", then in PowerShell:
-
-```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
-.\Get-NVIDIA-DLSS.cmd
-powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
-```
-
-Put the path to **your** `game_scarlett_master.exe` in the last line. The
-first start builds the layer, which takes a few minutes.
-
-Options, requirements in full and the details are under
-[How to run it](#how-to-run-it).
-
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files **you** supply,
-tuned for **NVIDIA RTX** cards.
-
-> **This repository contains no game files, code or assets.** You need your
-> own legally obtained copy of the title. It is not affiliated with or endorsed
-> by the title's developer or publisher, nor by NVIDIA. See
-> [docs/asset-policy.md](docs/asset-policy.md).
-
-## Built from many projects, and from running every one of them
-
-This repository did not come from one place, and the base it stands on today
-is the end of a long comparison, not the start of the work. Over several weeks
-we built, ran and measured many projects on the same NVIDIA PC: Leonida,
-[Marvisak's VIctory](https://github.com/Marvisak/VIctory),
-[fxceless's fork](https://github.com/fxceless/victory-fork),
-[the 7900 XTX fork](https://github.com/avatarmanz/VIctory-7900XTX),
-[Belobug's](https://github.com/Belobug/VIctory-Belobug-AMD),
-[DexNom's](https://github.com/DexNom/VIctory),
-[CGBJ's cool_fox](https://github.com/codec-d/cool_fox), Kelvaroq's, Neptune,
-xcl (another layer for the same title) and then
-[foxhound](https://github.com/readmet3xt-lab/foxhound). On each we found what
-stopped it on an RTX card, fixed or worked around it, measured the result, and
-carried what we learned to the next. Every pull request sent here was built
-and run on the same card before it was merged. No single project got here
-alone, and choosing the base that runs best was only one result of that work.
-
-### What this fork brings
-
-Not one fix but a long line of them: days of work, much of it around the clock,
-across every one of those codebases, more than 300 measured runs on the same
-RTX PC, and each fault chased towards its cause before the next build. In rendering, in
-speed, in the picture and in simply being able to play it:
-
-**Rendering fixes**
-
-- **Draws no longer skipped on NVIDIA.** NVIDIA caps the view heap below what
-  the title asks for; thousands of draws a frame were dropped, the screen
-  rarely updated and the character jumped from place to place. The pool of
-  descriptor slots was reworked until almost none were.
-- **Menus, loading screens and subtitles on Series S**, black until then (the
-  interface plane laid over the game), and **faces that move** (their network
-  carried through as integers): ported from fxceless's pull requests 1189 and
-  927 and made to work on this card.
-- **The intro video without flicker**: its frames came out of order.
-- **Black blobs gone**: a single bad number from a shader, spread by blur and
-  the upscaler into patches on faces and in the air, is caught where it is
-  written.
-- **White, hazy rooms explained and tamed**: the title's ray tracing was
-  running with its structure builder off, so every ray missed. Which passes
-  can be left out without filling the picture with rainbow glitter was worked
-  out pass by pass.
-- **The ray-tracing structure builder running on NVIDIA**, on CGBJ's renderer:
-  the draws dropped for it went from thousands a frame to one.
-- **White-outs with black holes further into the game** followed up in frames
-  captured in play: thousands of draws a frame were being dropped there for
-  that same missing structure.
-
-**Speed**
-
-- **Memory compares moved to the card**: 11 to about 22 frames a second on the
-  base of the time.
-- **Settings measured, not guessed**: one switch at a time, on the same scene,
-  run after run.
-- **The base itself chosen by measurement**: the same rooms went from 15-17
-  frames a second to 26-30, at a higher resolution.
-- **The 30 frames a second were the title's own frame interval**, not the
-  layer's limit: found, and lifted.
-
-**Picture and frames**
-
-- **DLSS in place of the title's upscaler**, with its model and mode to choose.
-- **DLSS frame generation with up to six frames shown for each one rendered**,
-  switched and changed while playing, without a restart (foxhound's is 2x, set
-  at the start). By Streamline's own count it shows exactly 2, 4 and 6.
-- **Why frame generation showed nothing on a full 12 GB card**, found and
-  fixed: the card's memory is now shared out so that it has room.
-- **The frame rate at the top left of the picture**: frames rendered a second
-  and, with frame generation, frames shown (`FPS: 28.4  FG: 170.4`).
-
-**Playing it**
-
-- **The F1 settings menu**, in every build: DLSS, frame generation, frame rate
-  cap, console profile, picture size, the light estimates and the main speed
-  switches, saved to `victory-settings.txt` and applied at the next start
-  ("SAVE AND RESTART NOW" does that for you; lines marked LIVE change at once).
-- **The F3 stats panel**, in every build: frame rate and frame time, frames
-  shown with frame generation, draws, how busy the GPU and the submitting
-  thread are, copies, RAM and VRAM. The menu switches it too.
-- **Open water without dark blocks.** Two of the title's water light programs
-  run on 32-lane cards only in a form that left whole tiles of the sea dark
-  (around boats, along shores, under bridges) and cost about 15 ms of the
-  card a frame. They are left out there: no blocks and 30 fps instead of 25
-  on the first boat ride (RTX 5070), with water that is darker and bluer.
-  WATER LIGHT in the menu (`VICTORY_WATER_LIGHT=1`) runs them again.
-- **One command to play**: the launcher builds the layer the first time and
-  applies what the menu saved.
-- **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
-  70 MB, taken out of NVIDIA's 263 MB release without downloading the rest.
-  NVIDIA's licence does not let a repository carry them, so they come from
-  NVIDIA.
-
-**Tested, not assumed**
-
-- Every pull request sent here was read line by line and, where it touched the
-  game, built and run on this card before it was merged: ten so far.
-
-Where each of these is today: this fork's own code in this tree is the F1
-menu, the stats panel in every build, the water light switch, frame
-generation from 2x to 6x with its live switching and memory handling, the
-lifted frame rate cap, the frame rate line, the launcher and the NVIDIA file
-fetcher. The foxhound line carries the descriptor slots, the
-compares on the card, the interface plane and the face network in its own
-form. The black-blob scrub, the graphics card picker and the ray-tracing
-builder path are in this repository's history, and come over as this base
-turns out to need them.
-
-### The base since 2026-11-26: foxhound
-
-On 2026-11-26 this fork moved onto
-[readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)
-(`02fc18a`, GPL-3.0-or-later). On the same PC it ran the same rooms at close to
-twice the frame rate of what this fork had, at a higher resolution, so its
-tree is now this one's, with its history kept, and this fork's own additions
-are on top. What foxhound is and how it got there is in its own README, kept as
-[docs/README-foxhound.md](docs/README-foxhound.md); its measurements are in
-[docs/findings.md](docs/findings.md).
-
-What foxhound brings:
-
-- the Series X profile at a native 2560x1440;
-- DLSS Super Resolution and DLSS Frame Generation through NVIDIA Streamline,
-  loaded when the game runs (nothing of NVIDIA's is needed to build);
-- an estimate of indirect light and of reflections in place of the title's ray
-  tracing, and fewer stalls at scene cuts.
-
-What this fork has on top of it is under
-[What this fork brings](#what-this-fork-brings) above.
-
-## Where it stands
-
-Tested on one PC: Windows 11, Ryzen 7 9800X3D, 64 GB RAM, **GeForce RTX 5070
-12 GB**; the title's Xbox Series build v1.0.2.1, Series X profile, 2560x1440
-output, DLSS Quality. Frame rates are the layer's own count, in the opening
-rooms.
+## Status (2026-11-27)
 
 | | |
 |---|---|
-| Opening rooms | mostly 26-30 frames a second rendered (33-38 ms a frame) |
-| Frame generation | 2x to 6x on top of that: by Streamline's own count, exactly 2, 4 and 6 frames shown for each one rendered |
-| Device losses, crashes | none in the measured runs |
-| Before this base (Series S, 720p to 1080p by DLSS) | 15-17 frames a second in the same rooms |
+| Cross-building `victory.exe` on Linux (gnullvm) | ✅ builds |
+| This fork's Linux work carried over | in progress (see the branch's history) |
+| Running a title under Proton | not measured on this base yet; on `kc/nvidia` the title reaches its first scenes at 0.2–1 fps |
 
-foxhound's own measurements, on an RTX 4070 SUPER, are in its README.
+The goal: every shader made, then 60 frames a second. trustno1's tree runs
+26–30 frames a second at 1440p on an RTX 5070 under Windows; hyphennn's
+tree (`kc/nvidia`) 8–11.
 
-What is known to be wrong:
+## Branches
 
-- **No ray tracing.** The title's own is off (`VICTORY_BVH_BUILDER=1`, or the
-  menu's RAY TRACING, turns it on: slow and with a broken picture on this
-  base). An estimate stands in for indirect light and reflections.
-- **Frame generation needs room in the card's memory.** The layer fills the
-  card with textures up to its budget; with frame generation on from the start
-  the launcher holds a fifth of the budget back (a little less while it is only
-  ready), so a few more textures can come late. Switched on from the menu on a
-  full 12 GB card it can still say that memory is past the budget; it then
-  runs, perhaps unevenly.
-- **Frames are only generated while the game's window has the focus**, and
-  about a second passes after a change before they come.
-- **The first run of every new build stutters** while the driver compiles
-  pipelines (foxhound's README, *Warming up*, says how to make them ahead).
-- "SAVE AND RESTART NOW" can leave the old game's process behind without a
-  window; it goes when the PC restarts.
-- What foxhound lists as wrong (the heat-haze pass left out, hitches in
-  cutscenes) applies here too.
+| Branch | What it is |
+|---|---|
+| `kc/foxhound` | **This branch.** trustno1's foxhound-based tree plus this fork's Linux work |
+| `kc/nvidia` | hyphennn's NVIDIA fork plus this fork's Linux work, with the run history in its `docs/kc-linux-status.md` |
+| `kc/linux` | The Linux work on top of current upstream VIctory |
+| `main` | Upstream VIctory plus this fork's repository setup |
 
-## How to run it
+trustno1's own README, with its credits, settings menu and Windows
+instructions, is [docs/README-trustno1.md](docs/README-trustno1.md);
+foxhound's is [docs/README-foxhound.md](docs/README-foxhound.md).
 
-You need Windows 10 or 11 (x64), a CPU with AVX2, 32 GB of RAM or more, an
-SSD, an NVIDIA GeForce RTX card with a recent driver (RTX 40 or later for frame
-generation, with hardware-accelerated GPU scheduling on; more than 2x needs an
-RTX 50), [Rust](https://rustup.rs) (the toolchain is pinned), the Visual Studio
-Build Tools with "Desktop development with C++", and **your own dump** of the
-title's Xbox Series build v1.0.2.1 (the folder with
-`game_scarlett_master.exe`).
+## Running under Proton
 
-```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
-copy victory.example.toml victory.toml      # then set game_dir to your dump's folder, outside this one
-.\Get-NVIDIA-DLSS.cmd                        # once: NVIDIA's DLSS and frame generation files, about 70 MB
-scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+### What you need
+
+- x86-64 Linux, a CPU with AVX2, and an NVIDIA card with the proprietary
+  driver. vkd3d-proton must expose Shader Model 6.6 and mesh shaders.
+- `umu-run` from [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher#installation).
+- **Proton Experimental** (Steam: install "Proton Experimental"), passed
+  with `PROTONPATH`. UMU-Proton 11.0-2e's vkd3d-proton turns two of the
+  title's compute shaders into invalid SPIR-V, and NVIDIA's driver crashes
+  on it (the window just closes); Experimental's does not.
+- **vkd3d-proton from master**, until a Proton release carries it. The
+  shader converter inside Proton Experimental 2026-11-12 (dxil-spirv from
+  2026-11-11) recurses forever on some of the title's largest shaders, and
+  the title stops a little later. dxil-spirv fixed this on 2026-11-25. Build
+  vkd3d-proton (needs meson, ninja, glslang, mingw-w64 and its `widl`):
+
+  ```sh
+  git clone --recursive https://github.com/HansKristian-Work/vkd3d-proton
+  cd vkd3d-proton
+  meson setup --cross-file build-win64.txt --buildtype release build.64
+  ninja -C build.64
+  ```
+
+  and put `build.64/libs/d3d12/d3d12.dll` and
+  `build.64/libs/d3d12core/d3d12core.dll` beside `victory.exe` (Wine loads
+  DLLs from the executable's folder first), or pass their folder to
+  `kc-run.sh --vkd3d`. The Proton log (`PROTON_LOG=1`) names the build that
+  loaded.
+- **Memory.** The title's own memory is about 8 GB, and the goal is
+  12–14 GB for a whole run, as on a console. Today a run goes past 16–18
+  GB, because victory keeps copies of title memory in the PC's memory for
+  the GPU, and NVIDIA's Linux driver pins every page of those buffers
+  when they are made (Windows pages out what nothing touches). This is
+  being cut down (see the status doc). The first build of the title's
+  pipelines also takes several GB at once: `VICTORY_PIPELINE_WORKERS=4`
+  builds fewer at a time.
+- **NVIDIA's 620 drivers can freeze the desktop.** After the driver logs
+  `NVRM: intermapRegisterDmaMapping: Failed to insert new mapping node`
+  (`journalctl -k`), its table of mappings is broken, and when the
+  process exits the driver can loop holding its lock: the screen
+  freezes and only a restart helps
+  ([NVIDIA/open-gpu-kernel-modules#1540](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1540),
+  fix in [#1542](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1542),
+  not merged yet). Other Proton games hit it too; low memory and many
+  buffers made and freed make it likelier. 615.x drivers did not freeze
+  on it.
+- **DXC**, Microsoft's open-source shader compiler: `dxcompiler.dll` and
+  `dxil.dll` from `bin/x64` of a
+  [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases).
+  Put both in one folder and set `VICTORY_DXC` to that folder. Wine's own
+  HLSL compiler refuses several shaders the GPU code compiles at runtime.
+  Without DXC, indirect draws are dropped.
+- **The BCPack tables, which you must source yourself.** The title's
+  streamed textures are packed with BCPack, and decoding needs the
+  format's constant tables. They are not this project's work and its
+  licence does not cover them, so this repository does not carry them (not
+  in its history either). Get them from material you are entitled to use,
+  as one file, `bcpack-tables.bin` (77,982 bytes, SHA-256 `1f1d4760…c36b`,
+  in full in [docs/asset-policy.md](docs/asset-policy.md)), and put it
+  beside `victory.exe` or set `VICTORY_BCPACK_TABLES` to it (a Linux path
+  is turned into a Wine one by the launcher). Without it those textures
+  stay empty.
+- Your own dump of the title, outside this repository.
+- A Windows build of `victory.exe` (build it on Linux, below).
+
+### Build `victory.exe` on Linux
+
+Use rustup. The toolchain is pinned in `rust-toolchain.toml`. Also install
+the x86-64 Linux UCRT build of
+[LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw/releases) and put its
+`bin` first on `PATH`.
+
+```sh
+rustup target add x86_64-pc-windows-gnullvm
+cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
 ```
 
-The first start builds the layer (a few minutes). `Get-NVIDIA-DLSS.cmd` gets
-NVIDIA's files from
-[NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline) into
-`nvidia-sdk\` (git-ignored). They are NVIDIA's, under NVIDIA's licences, which
-are saved beside them; this repository does not carry them and may not. Nothing
-is downloaded unless you run that file; `VICTORY_STREAMLINE_DIR` names another
-folder if you have the Streamline SDK already.
+`scripts/kc-env.sh` sets all of this up when it is sourced
+(`. scripts/kc-env.sh`). It finds LLVM-MinGW under `~/.local/opt` and can
+use a rustup kept apart from a system Rust. Read it first, then adjust
+it to your machine.
 
-`scripts\play-nvidia.ps1` is `scripts\play-foxhound.ps1` under the name this
-fork has always had; its options:
+### Check without the game
 
-| Option | What |
-|---|---|
-| *(none)* | Series X profile, 2560x1440, DLSS Quality, no frame rate cap, frame generation ready but off |
-| `-FrameGen`, `-FrameGenX 4` | frame generation on from the start, 2 to 6 frames shown for each one rendered |
-| `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
-| `-Fps 60` | a frame rate cap (30 is the title's own) |
-| `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
-| `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
-| `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
-| `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
-| `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
-| `-More @{VICTORY_X='1'}` | add or override any switch |
+```sh
+bash tests/proton-launcher.sh   # the launcher's argument and path handling; no Wine
+./tests/proton-smoke.sh         # a synthetic title under real Proton; expects exit 42
+```
 
-What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
-delete that file to go back to them. Full screen: start the game, then run
-`.\scripts\fullscreen.ps1` in another window. Logs go to
-`%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
+`proton-smoke.sh` runs the `victory.exe` already built, so build first.
 
-## How it works, and the findings
+### Run the title
 
-- [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README
-  (set-up by hand, warming up, its switches).
-- [docs/architecture.md](docs/architecture.md): the layer's parts.
-- [docs/findings.md](docs/findings.md): measurements behind the choices.
-- [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
-- [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
-  and the light estimate.
-- [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this
-  repository.
+```sh
+export VICTORY_DXC=/path/to/dxc                                     # the folder with dxcompiler.dll
+export PROTONPATH="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
+export WINEPREFIX="$HOME/.local/share/victory/proton-exp"           # its own prefix
+export VICTORY_WAVE_WIDE=last                                       # NVIDIA's 32-lane waves
+export VICTORY_PIPELINE_WORKERS=4 VICTORY_PIPELINE_COMPUTE_WAIT=0   # see "Memory" above; the status doc
+./scripts/victory-proton.sh "/path/to/your/dump/title.exe"            # map and bind only
+./scripts/victory-proton.sh "/path/to/your/dump/title.exe" --execute  # run it
+```
+
+- **Map and bind first.** Leave out `--execute` to check that the title maps
+  and its imports bind, without running it.
+- **Options.** Other `victory run` options are passed through, and
+  arguments after `--` go to the title.
+- **Prefix and cache.** The default Wine prefix is
+  `~/.local/share/victory/proton`, and the shader caches go under
+  `~/.cache/victory`. `WINEPREFIX`, `GAMEID`, `PROTONPATH` and `VICTORY_EXE`
+  override the defaults. See [docs/proton-launcher.md](docs/proton-launcher.md).
+- **Paths in `victory.toml`.** Copy `victory.example.toml` to `victory.toml`
+  and write its paths in Windows form. Your files appear on drive `Z:`, for
+  example `Z:\home\you\dumps\title`.
+- **Don't run `winetricks d3dcompiler_47`.** That compiler is too old for
+  these shaders and makes things worse. See the status doc.
+- **No pad input with Steam running?** Steam Input keeps four empty virtual
+  Xbox 360 pads that take every XInput slot. In the prefix, turn off
+  winebus's hidraw and evdev paths (`DisableHidraw`=1, `DisableInput`=1 under
+  `HKLM\System\CurrentControlSet\Services\winebus`) and set
+  `SDL_GAMECONTROLLER_IGNORE_DEVICES=0x28de/0x11ff`, so SDL hands your own
+  pad to slot 0. With no pad at all, the keyboard is one.
+- **Recorded runs.** `scripts/kc-run.sh --profile linux-nvidia --mem-max 18G
+  --watchdog TITLE.exe` runs the same with a memory cap, a freeze watchdog
+  and a run folder outside the checkout (`victory.log`, GPU and memory
+  readings, the crash log).
+
+The launcher converts a Linux `VICTORY_DXC` path to the `Z:` path that
+Wine needs. Runs so far reach the first scenes but do not last (see the
+status table), so treat a run as a test, not a way to play.
+
+## Development
+
+```sh
+. scripts/kc-env.sh
+cargo xtask install-hooks   # the asset-policy check on every commit
+cargo xtask policy          # the same check over the whole tree
+```
+
+- **Asset policy.** The pre-commit hook is an allowlist (see
+  [docs/asset-policy.md](docs/asset-policy.md)). Nothing from a game may be
+  committed.
+- **Run logs.** Logs of real runs stay out of git.
+- **Native Linux tests.** The ones that build natively, and the test of the
+  runtime HLSL helpers under Proton, are in
+  [docs/kc-linux-status.md](docs/kc-linux-status.md).
+- **More docs.** [docs/linux-proton.md](docs/linux-proton.md) and
+  [docs/arch-proton-rendering.md](docs/arch-proton-rendering.md) cover Linux
+  further. For the run options, debugging variables and keyboard controls
+  inherited from upstream and hyphennn, see
+  [docs/hyphennn-readme.md](docs/hyphennn-readme.md).
 
 ## Credits
 
-A tree of other people's work with a little on top; the history is kept.
-
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**
+  and those who sent it pull requests: the base of this branch, with its
+  history kept (the BCPack tables removed from every commit). Their own
+  credits, for the many projects that tree was built from, are in
+  [docs/README-trustno1.md](docs/README-trustno1.md).
 - **[foxhound](https://github.com/readmet3xt-lab/foxhound)** by
-  readmet3xt-lab: the base of this fork since 2026-11-26, and through it:
+  readmet3xt-lab: the base of trustno1's tree.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**,
-  **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**,
-  **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)**,
-  **[DexNom/VIctory](https://github.com/DexNom/VIctory)**,
-  **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
-  and the others foxhound's README names.
-- Everyone who sent pull requests to this fork before the move; that work is
-  in the history, on the branch that was `main` until then.
-- NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time
-  from a folder you supply.
-- Much of this fork's code was written with
+  contributors: the loader, runtime services, Direct3D 12 back end and
+  shader recompiler.
+- **hyphennn ([fxceless/victory-fork](https://github.com/fxceless/victory-fork))**
+  and that fork's contributors, which foxhound built on, and which
+  `kc/nvidia` is.
+- **[JMAN730/victory](https://github.com/JMAN730/victory)**: the Proton
+  launcher, the smoke test, the Linux notes and the DXC fallback for the
+  helper shaders, by Codex, SkippySteve, MiguVT, pablogonz12 and NiHuShu.
+- This fork's changes are developed with
   [Claude Code](https://claude.com/claude-code).
 
 ## License
 
-GPL-3.0-or-later, as VIctory and foxhound. See [LICENSE](LICENSE); the one file
-that is not covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as VIctory, foxhound and trustno1's tree. See
+[LICENSE](LICENSE).

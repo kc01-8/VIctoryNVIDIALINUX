@@ -45,8 +45,6 @@
 
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
-# The one exception (docs/asset-policy.md): the BCPack format's constant tables.
-!/crates/victory-formats/src/bcpack-tables.bin
 *.dat
 *.pak
 *.rpf
@@ -84,3 +82,12 @@ Thumbs.db
 # What the F1 menu saved
 /victory-settings.txt
 /victory-settings.*.txt
+
+# Maintainer-local files (never committed)
+/private.md
+/CLAUDE.local.md
+/local.env
+/diagnostics/
+
+# The BCPack tables are supplied by the user, never committed (docs/asset-policy.md)
+bcpack-tables.bin

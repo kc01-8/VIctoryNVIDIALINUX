@@ -35,17 +35,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// This fork downloads nothing (no network path): what the upstream launcher
+/// fetched, the user puts in place. Every fetcher ends here.
+fn no_downloads(what: &str, to: &Path) -> Result<()> {
+    anyhow::bail!("this build downloads nothing: put {what} into {} yourself", to.display())
+}
+
 /// The title's executable, looked for beside this program.
 const GAME: &str = "game_scarlett_master.exe";
-
-/// `scripts\get-nvidia-sdks.ps1`, run by Windows PowerShell.
-const FETCH: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
-
-/// `scripts\get-amd-fsr.ps1`, run by Windows PowerShell.
-const FETCH_FSR: &str = include_str!("../../../scripts/get-amd-fsr.ps1");
-
-/// `scripts\get-d3d12.ps1`, run by Windows PowerShell.
-const FETCH_D3D12: &str = include_str!("../../../scripts/get-d3d12.ps1");
 
 /// The two AMD files FSR 3 frame generation loads.
 const FSR_FILES: [&str; 2] = ["amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll"];
@@ -385,22 +382,7 @@ const LOG_PREFIX: &str = "victory-nvidia-play-";
 
 /// Runs the fetcher: NVIDIA's files from NVIDIA's GitHub into `to`.
 fn fetch(to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
-    let script = to.join("get-nvidia-sdks.ps1");
-    std::fs::write(&script, FETCH).with_context(|| format!("writing {}", script.display()))?;
-    let status = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
-        .arg("-To")
-        .arg(to)
-        .status()
-        .context("starting Windows PowerShell")?;
-    let _ = std::fs::remove_file(&script);
-    anyhow::ensure!(
-        status.success() && has_streamline(&to.join("Streamline").join("bin").join("x64")),
-        "NVIDIA's files did not arrive (see above); the title runs without DLSS and frame generation"
-    );
-    Ok(())
+    no_downloads("NVIDIA's Streamline files (Streamline\\bin\\x64, from NVIDIA's own release)", to)
 }
 
 /// `victory get-dlss`.
@@ -412,45 +394,14 @@ pub(crate) fn get_dlss() -> Result<()> {
 
 /// Asks once, at a start without NVIDIA's files, whether to fetch them.
 fn offer_dlss() {
-    let Ok(to) = nvidia_home() else { return };
-    let declined = to.join("declined");
-    if declined.exists() || !std::io::stdin().is_terminal() {
-        println!("No NVIDIA files: running without DLSS and frame generation (`victory get-dlss` fetches them).");
-        return;
-    }
-    println!("NVIDIA's DLSS and frame generation files are not on this PC yet. They are NVIDIA's own,");
-    println!("under NVIDIA's licences, and come from github.com/NVIDIA-RTX/Streamline (about 70 MB, once).");
-    print!("Download them now? [Y/n] ");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    let _ = std::io::stdin().read_line(&mut answer);
-    if answer.trim().to_ascii_lowercase().starts_with('n') {
-        let _ = std::fs::create_dir_all(&to);
-        let _ = std::fs::write(&declined, "asked once; `victory get-dlss` fetches them\r\n");
-        println!("Not downloaded. `victory get-dlss` does it later; the title runs with its own upscaling.");
-    } else if let Err(e) = fetch(&to) {
-        println!("{e:#}");
+    if let Ok(to) = nvidia_home() {
+        println!("No NVIDIA files: running without DLSS and frame generation (put NVIDIA's Streamline files in {}).", to.display());
     }
 }
 
 /// Runs the AMD fetcher: AMD's FSR 3 files from AMD's GitHub into `to`.
 fn fetch_fsr(to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
-    let script = to.join("get-amd-fsr.ps1");
-    std::fs::write(&script, FETCH_FSR).with_context(|| format!("writing {}", script.display()))?;
-    let status = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
-        .arg("-To")
-        .arg(to)
-        .status()
-        .context("starting Windows PowerShell")?;
-    let _ = std::fs::remove_file(&script);
-    anyhow::ensure!(
-        status.success() && has_fsr(to),
-        "AMD's files did not arrive (see above); the title runs without FSR 3 frame generation"
-    );
-    Ok(())
+    no_downloads("AMD's FSR 3 files (from AMD's own release)", to)
 }
 
 /// `victory get-fsr`.
@@ -462,35 +413,10 @@ pub(crate) fn get_fsr() -> Result<()> {
 
 /// Asks once, at a start that would use FSR 3 without AMD's files, whether to fetch them.
 fn offer_fsr(card: &str) {
-    let Ok(to) = amd_home() else { return };
-    let declined = to.join("declined");
-    if declined.exists() || !std::io::stdin().is_terminal() {
-        println!("No AMD FSR 3 files: frame generation stays off on this card (`victory get-fsr` fetches them).");
-        return;
-    }
-    if card.is_empty() {
-        println!("FSR 3 frame generation is chosen, and AMD's files for it are not on this PC yet.");
-    } else {
-        println!("This card ({card}) has no DLSS frame generation (it needs an RTX 40 or later), but AMD's");
-        println!("FSR 3 frame generation runs on it (2x). AMD's files for it are not on this PC yet.");
-    }
-    println!("They are AMD's own, under AMD's licence, and come from github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK");
-    println!("(about 30 MB, once).");
-    print!("Download them now? [Y/n] ");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    let _ = std::io::stdin().read_line(&mut answer);
-    if answer.trim().to_ascii_lowercase().starts_with('n') {
-        let _ = std::fs::create_dir_all(&to);
-        let _ = std::fs::write(&declined, "asked once; `victory get-fsr` fetches them\r\n");
-        println!("Not downloaded. `victory get-fsr` does it later; the title runs without frame generation.");
-    } else if let Err(e) = fetch_fsr(&to) {
-        println!("{e:#}");
+    if let Ok(to) = amd_home() {
+        println!("No AMD FSR 3 files: frame generation stays off on this card ({card}; put AMD's files in {}).", to.display());
     }
 }
-
-/// `scripts\get-mfg-unlocker.ps1`, run by Windows PowerShell.
-const FETCH_MFG: &str = include_str!("../../../scripts/get-mfg-unlocker.ps1");
 
 /// The mod's DLL, under its own name: loaded by this program (main.rs, [`load_mfg`]), not by
 /// Windows in place of one of its own, so nothing is renamed or put beside the game.
@@ -512,22 +438,7 @@ fn older_rtx(name: &str) -> bool {
 
 /// Runs the fetcher: MFG Unlocker from its author's GitHub release into `to`.
 fn fetch_mfg(to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
-    let script = to.join("get-mfg-unlocker.ps1");
-    std::fs::write(&script, FETCH_MFG).with_context(|| format!("writing {}", script.display()))?;
-    let status = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
-        .arg("-To")
-        .arg(to)
-        .status()
-        .context("starting Windows PowerShell")?;
-    let _ = std::fs::remove_file(&script);
-    anyhow::ensure!(
-        status.success() && to.join(MFG_DLL).is_file(),
-        "MFG Unlocker did not arrive (see above); the game runs without it"
-    );
-    Ok(())
+    no_downloads("MFG Unlocker's DLL (from its author's release)", to)
 }
 
 /// `victory get-mfg`: fetches it (F1's MFG UNLOCKER turns it on).
@@ -543,35 +454,10 @@ pub(crate) fn get_mfg() -> Result<()> {
 /// someone else's mod, NVIDIA does not support what it does, and it was not tested here.
 /// `true`: turned on (saved in `menu_file`, as the F1 menu would).
 fn offer_mfg(card: &str, menu_file: &Path) -> bool {
-    let Ok(to) = mfg_home() else { return false };
-    let declined = to.join("declined");
-    if declined.exists() || !std::io::stdin().is_terminal() {
-        return false;
-    }
-    println!("This card ({card}) runs DLSS, but NVIDIA's DLSS frame generation only on RTX 40 and later.");
-    println!("MFG Unlocker, someone else's mod (github.com/dashdogy/MFG-Unlocker, MIT licence, about 5 MB),");
-    println!("unlocks it on RTX 20 and 30 cards. NVIDIA does not support that, and it was not tested with");
-    println!("this game. On, it is downloaded now and at every start loaded by victory.exe; F1, MFG UNLOCKER");
-    println!("turns it off again. Off, the game uses AMD's FSR 3 frame generation (2x) on this card.");
-    print!("Turn MFG Unlocker on? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    let _ = std::io::stdin().read_line(&mut answer);
-    let _ = std::fs::create_dir_all(&to);
-    if !answer.trim().to_ascii_lowercase().starts_with('y') {
-        let _ = std::fs::write(&declined, "asked once; F1, MFG UNLOCKER turns it on\r\n");
-        println!("Left off. F1, MFG UNLOCKER turns it on later.");
-        return false;
-    }
-    let mut text = std::fs::read_to_string(menu_file).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push_str("\r\n");
-    }
-    text.push_str("VICTORY_MFG_UNLOCKER=1\r\n");
-    if let Err(e) = std::fs::write(menu_file, text) {
-        println!("Could not save the choice ({e}); on for this start only.");
-    }
-    true
+    // Nothing is fetched, so nothing is asked: F1's MFG UNLOCKER turns it on
+    // once its DLL is in place.
+    let _ = (card, menu_file);
+    false
 }
 
 /// With MFG Unlocker on: the DLL, fetched first where it is missing (no question: turning it on
@@ -580,11 +466,8 @@ fn mfg_dll() -> Option<PathBuf> {
     let to = mfg_home().ok()?;
     let dll = to.join(MFG_DLL);
     if !dll.is_file() {
-        println!("MFG UNLOCKER is on and not on this PC yet: downloading it.");
-        if let Err(e) = fetch_mfg(&to) {
-            println!("{e:#}");
-            return None;
-        }
+        println!("MFG UNLOCKER is on but its DLL is not in {}: running without it (put it there yourself).", to.display());
+        return None;
     }
     Some(dll)
 }
@@ -629,22 +512,7 @@ fn shader_model() -> Option<(u32, u32)> {
 
 /// Runs the fetcher: Microsoft's D3D12Core.dll from nuget.org into `to`.
 fn fetch_d3d12(to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).with_context(|| format!("creating {} (beside victory.exe)", to.display()))?;
-    let script = std::env::temp_dir().join(format!("victory-get-d3d12-{}.ps1", std::process::id()));
-    std::fs::write(&script, FETCH_D3D12).with_context(|| format!("writing {}", script.display()))?;
-    let status = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
-        .arg("-To")
-        .arg(to)
-        .status()
-        .context("starting Windows PowerShell")?;
-    let _ = std::fs::remove_file(&script);
-    anyhow::ensure!(
-        status.success() && to.join("D3D12Core.dll").is_file(),
-        "Microsoft's Direct3D 12 runtime did not arrive (see above)"
-    );
-    Ok(())
+    no_downloads("Microsoft's D3D12Core.dll (the D3D12 Agility SDK)", to)
 }
 
 /// `victory get-d3d12`.
@@ -670,15 +538,8 @@ fn check_shader_model() -> Result<()> {
         println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
         println!("runs 6.6. It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
         println!("and goes into {}.", to.display());
-        let yes = if std::io::stdin().is_terminal() {
-            print!("Download it now? [Y/n] ");
-            let _ = std::io::stdout().flush();
-            let mut answer = String::new();
-            let _ = std::io::stdin().read_line(&mut answer);
-            !answer.trim().to_ascii_lowercase().starts_with('n')
-        } else {
-            true
-        };
+        println!("This build downloads nothing: put D3D12Core.dll there yourself.");
+        let yes = false;
         if yes {
             match fetch_d3d12(&to) {
                 Ok(()) => match shader_model() {
