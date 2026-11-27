@@ -11,6 +11,10 @@
 #                 (for example 18G): past it the kernel kills the run, not the desktop
 # --watchdog      kill the run on an NVRM Xid, when its processes use no CPU
 #                 for 45 s (a freeze), or when it prints nothing for 300 s
+# --vkd3d DIR     use the d3d12.dll and d3d12core.dll in DIR (a vkd3d-proton
+#                 build) instead of Proton's: the run gets a bin/ folder with
+#                 them beside a hard link (or copy) of victory.exe, and Wine
+#                 loads DLLs from the executable's folder first
 #
 # The run folder is ~/.local/share/victory/runs/<UTC>-<sha>-<profile>/:
 # meta.txt, run.log (victory's output), gpu.csv (nvidia-smi dmon), mem.csv
@@ -29,6 +33,7 @@ dry=0
 timeout_s=0
 mem_max=
 watchdog=0
+vkd3d=
 while (($#)); do
     case $1 in
         --profile) profile=${2:?--profile needs a name}; shift 2 ;;
@@ -36,7 +41,8 @@ while (($#)); do
         --timeout) timeout_s=${2:?--timeout needs seconds}; shift 2 ;;
         --mem-max) mem_max=${2:?--mem-max needs a size}; shift 2 ;;
         --watchdog) watchdog=1; shift ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        --vkd3d) vkd3d=${2:?--vkd3d needs a folder}; shift 2 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         --) shift; break ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) break ;;
@@ -47,6 +53,11 @@ shift
 [[ -f $title ]] || { echo "no such title executable: $title" >&2; exit 1; }
 profile_file=$root/profiles/$profile.env
 [[ -f $profile_file ]] || { echo "no profile $profile_file" >&2; exit 1; }
+if [[ -n $vkd3d ]]; then
+    for f in d3d12.dll d3d12core.dll; do
+        [[ -f $vkd3d/$f ]] || { echo "no $f in $vkd3d" >&2; exit 1; }
+    done
+fi
 
 # shellcheck source=/dev/null
 [[ -f $root/scripts/kc-env.sh ]] && . "$root/scripts/kc-env.sh"
@@ -78,6 +89,16 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 run=$data_home/victory/runs/$stamp-$sha$dirty-$profile
 mkdir -p -- "$run"
 
+if [[ -n $vkd3d ]]; then
+    # The same default as victory-proton.sh.
+    exe=${VICTORY_EXE:-${CARGO_TARGET_DIR:-$root/target}/x86_64-pc-windows-gnullvm/release/victory.exe}
+    [[ -f $exe ]] || { echo "no victory.exe at $exe (set VICTORY_EXE)" >&2; exit 1; }
+    mkdir -p -- "$run/bin"
+    ln -f -- "$exe" "$run/bin/victory.exe" 2>/dev/null || cp -- "$exe" "$run/bin/victory.exe"
+    cp -- "$vkd3d/d3d12.dll" "$vkd3d/d3d12core.dll" "$run/bin/"
+    export VICTORY_EXE=$run/bin/victory.exe
+fi
+
 {
     echo "utc       $stamp"
     echo "commit    $(git -C "$root" rev-parse HEAD)$dirty"
@@ -89,6 +110,12 @@ mkdir -p -- "$run"
     echo "memory    $(free -m | awk '/^Mem:/{print $2 " MiB total, " $7 " MiB available"}'); swap $(free -m | awk '/^Swap:/{print $3 "/" $2 " MiB used"}')"
     echo "proton    ${PROTONPATH:-UMU default} $(ls -d "$HOME"/.local/share/Steam/compatibilitytools.d/UMU-Proton-* 2>/dev/null | sort -V | tail -1 | xargs -r basename)"
     echo "dxc       ${VICTORY_DXC:-unset}"
+    echo "exe       ${VICTORY_EXE:-default} $( [[ -n ${VICTORY_EXE:-} ]] && sha256sum "$VICTORY_EXE" | cut -c1-16)"
+    if [[ -n $vkd3d ]]; then
+        echo "vkd3d     $vkd3d: $(head -c 200 "$vkd3d/version" 2>/dev/null || echo 'no version file') ($(sha256sum "$vkd3d/d3d12core.dll" | cut -c1-16))"
+    else
+        echo "vkd3d     Proton's"
+    fi
     echo
     echo "## profile"
     grep -v -E '^\s*(#|$)' "$profile_file" || echo "(empty)"
