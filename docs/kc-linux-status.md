@@ -97,7 +97,7 @@ NVRM Xid in any run.
 | 20, 21 | Experimental + vkd3d-proton master | no crash; frames stop at the first big load while the title waits for compute pipelines being made, and the watchdog fires (below) |
 | 22 | as 20, the pipeline library fixed, `VICTORY_PIPELINE_COMPUTE_WAIT=0` | through the load into the first 3D scenes (up to 6,000 draws a frame, under 1 fps); killed by the kernel at the 18 GB cap 3m30s in, with 12 pipeline workers |
 | 23 | as 22, `VICTORY_PIPELINE_WORKERS=4`, the library from run 22 | in the 3D scenes 2m25s in and still drawing (0.2–0.5 fps, peak 15.9 GB) when `kc-run.sh`'s own watchdog killed it at 5 min: it watched `run.log`, which stops growing once the log goes to `victory.log` (fixed) |
-| 24 | as 23, the watchdog fixed | every known pipeline made 1m20s in, before the load; in the 3D scenes from 2 min at 0.1–0.8 fps, at the 18 GB cap from about 2m20s; still running at 8 min (below) |
+| 24 | as 23, the watchdog fixed | every known pipeline made 1m20s in, before the load; in the 3D scenes from 2 min at 0.1–0.8 fps, at the 18 GB cap from about 2m20s; killed by the kernel at the cap 9m30s in (below) |
 
 **The driver crash, reproduced outside the title.** The saved shaders
 (`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
@@ -203,7 +203,8 @@ frame of run 23); the GPU's own work is about 0.3 s.
 PC's memory.** The library and the early list from runs 22–23 had every
 pipeline built 1m20s in, before the load. The 3D scenes followed at
 2 minutes, at 0.1–0.4 fps with no pipeline left to make. Then the run sat
-at the 18 GB cap, the kernel taking back file cache to keep it going.
+at the 18 GB cap, the kernel taking back file cache to keep it going,
+until it killed the run for memory 9m30s in.
 
 - **The card was full.** Its own memory stood at its 10.2 GB budget, and
   6 GB more of GPU data was in the PC's memory, which vkd3d-proton offers
