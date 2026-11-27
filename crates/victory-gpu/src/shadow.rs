@@ -5183,6 +5183,9 @@ pub(crate) fn in_place_gone() -> u64 {
 fn mark_gone(gone: &[Arc<Shadow>]) {
     for shadow in gone {
         shadow.gone.store(true, Ordering::Release);
+        if shadow.views.is_some() {
+            crate::inplace::views_let_go(shadow.start);
+        }
     }
     if !gone.is_empty() {
         IN_PLACE_GONE.fetch_add(gone.len() as u64, Ordering::AcqRel);

@@ -108,7 +108,50 @@ fn most() -> u64 {
 /// pages where they had been read, such windows that went on with pages
 /// marked changed where nothing had read them yet, and such windows let go
 /// later because an ask reached a changed page.
-static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+static STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// How many times a window over the pool through views of our own that
+/// began in each 4 MiB cell was let go because the title showed other pages
+/// there ([`views_let_go`]).
+static CHURN: std::sync::Mutex<BTreeMap<u64, u32>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// After how many let-gos a cell's window over the pool is a copy instead
+/// of views of our own (`VICTORY_INPLACE_VIEWS_CHURN`; 2 unless set, 0:
+/// never). Under Wine every view mapped or unmapped is a request to the
+/// wineserver, one thread for the whole prefix: with every window over the
+/// pool in views (kc/foxhound run 39) it took 81 % of a core, some 2,000
+/// views mapped and as many unmapped a second, and the title's threads
+/// waited behind it; with none (run 41) 30 %, but the copies' memory, which
+/// NVIDIA's Linux driver pins, went from 0.2 to 4.4 GB. Most of the pool's
+/// cells show the same pages for long; the few the title maps anew all the
+/// time are those that churn.
+fn churn_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_VIEWS_CHURN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// A window over the pool through views of our own that began at `start`
+/// was let go because the title showed other pages there.
+pub(crate) fn views_let_go(start: u64) {
+    let mut churn = CHURN.lock().unwrap_or_else(|e| e.into_inner());
+    *churn.entry(start >> 22).or_default() += 1;
+}
+
+/// Whether the cell of `start` was let go [`churn_limit`] times.
+fn churned(start: u64) -> bool {
+    let limit = churn_limit();
+    limit != 0
+        && CHURN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(start >> 22))
+            .is_some_and(|&n| n >= limit)
+}
 
 /// Counts a window over the pool let go at an ask that reached one of its
 /// changed pages (`crate::shadow`).
@@ -470,7 +513,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     // A window over the page pool, through views of our own. Memory that
     // is not the pool's (or that could not be mapped again) goes on to the
     // rules below, which turn the pool's down.
-    if window && views_on() {
+    // One whose cell the title maps anew all the time is a copy instead
+    // ([`churn_limit`]).
+    if window && views_on() && churned(start) {
+        STATS[15].fetch_add(1, Ordering::Relaxed);
+    } else if window && views_on() {
         let host = crate::host::host()?;
         match place_views(&host.device, start, len) {
             Ok(placed) => {
@@ -573,7 +620,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB ({} of them {} MB over the page pool through views of our own, VICTORY_INPLACE_VIEWS; {} such refused by the host, \
-         {} kept and {} let go when the title mapped pages there again, {} marked changed where nothing had read, {} let go at a later ask), \
+         {} kept and {} let go when the title mapped pages there again, {} marked changed where nothing had read, {} let go at a later ask, {} made copies instead in cells that churn, VICTORY_INPLACE_VIEWS_CHURN), \
          {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
@@ -585,6 +632,7 @@ fn say() {
         s[12],
         s[13],
         s[14],
+        s[15],
         s[2],
         s[3] >> 20,
         s[4],
@@ -1774,6 +1822,20 @@ pub(crate) mod tests {
         let holes = vec![None; ZEROS / K64 + 3];
         assert_eq!(runs(&holes), vec![(0, ZEROS / K64, None), (ZEROS / K64, 3, None)]);
         assert!(runs(&[]).is_empty());
+    }
+
+    /// A cell whose window over the pool was let go twice gets copies from
+    /// then on; one let go once, or never, gets views.
+    #[test]
+    fn a_cell_that_churns_gets_copies() {
+        let (once, twice) = (0x7f00_0040_0000u64, 0x7f00_0080_0000u64);
+        assert!(!churned(once) && !churned(twice));
+        views_let_go(once);
+        views_let_go(twice + 0x1_0000);
+        views_let_go(twice + 0x20_0000);
+        assert!(!churned(once));
+        assert!(churned(twice) && churned(twice + 0x3f_0000));
+        assert!(!churned(twice + 0x40_0000));
     }
 
     /// A window over the pool says whether a page the title maps again is
