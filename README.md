@@ -28,11 +28,12 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-27, 01:00 UTC)
+## Status of this fork (2026-11-27, 01:20 UTC)
 
-**Playable, slowly: about 9.7 world frames per second at the first boat mission at 3,300 to 4,100
-draws (usual frame 101 to 105 ms, the card 58 to 61 ms of it; the console runs 30), 10 to 14 in lighter
-views. The
+**Playable, slowly: about 11 world frames per second at the first boat mission at 1,500 to 3,300
+draws (usual frame 88 ms), 8.5 at 3,300 and more (115 to 120 ms); the console runs 30. The card is no
+longer the limit (53 to 66 ms a frame, the submitting thread waits for it about 0 ms); the thread that
+prepares submissions is (65 to 87 ms a frame at work). The
 open water now shows waves and the sun's path with no black patches. The tester has played from the opening through the prologue and past
 the first boat mission. The graphics card is still lost now and then 30 to 50 minutes into a session,
 before the title's next save point; cause not known yet. Shadowed areas are still black.**
@@ -51,7 +52,17 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-27, 01:00 UTC)
+### Newest (2026-11-27, 01:20 UTC)
+
+- **The flights are no longer settled for title bytes changed under shader writes
+  (`VICTORY_MASKED_PATCH`, on by default):** a page with more changed runs than the merge's cap goes
+  to the card as a masked patch (offset, byte mask, value per dword) after the flights. In an on/off
+  split: waiting for the card 1 to 2 ms against 11 to 32, the usual frame 10 to 15 ms shorter.
+- **Indirect mesh draws are launched by an amplification stage (`VICTORY_MESH_LAUNCH`, on by default,
+  after pull request #1381):** no clamp pass before each record; the card 5 ms less a frame in an
+  on/off split. The translated mesh shaders follow the same switch (shader caches must be rebuilt).
+
+### Earlier (2026-11-27, 01:00 UTC)
 
 - **Measured (one run, 3,300 to 4,100 draws): usual world frame 101 to 105 ms, the card 58 to 61 ms**
   (113 and 71 before). In it: the fast-math flag by default with `VICTORY_SHADER_FAST_BITS` 24 (no
