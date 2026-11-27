@@ -60,6 +60,12 @@ if [[ $VKD3D_SHADER_CACHE_PATH != 0 ]]; then
     mkdir -p -- "$VKD3D_SHADER_CACHE_PATH"
 fi
 mkdir -p -- "$DXVK_STATE_CACHE_PATH"
+# DXC for the helper shaders Wine's compiler refuses (docs/kc-linux-status.md):
+# a Linux path to dxcompiler.dll or its folder is handed over on Z:.
+if [[ ${VICTORY_DXC:-} == /* ]]; then
+    dxc=$(realpath -m -- "$VICTORY_DXC")
+    export VICTORY_DXC="Z:${dxc//\//\\}"
+fi
 windows_title=${title//\//\\}
 windows_binary=${binary//\//\\}
 export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$(dirname -- "$binary")}

@@ -13,6 +13,7 @@ cat >> "$work/bin/umu-run" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" > "$LAUNCH_RECORD"
 printf '%s\n' "$WINEPREFIX" "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH" > "$ENV_RECORD"
+printf '%s\n' "${VICTORY_DXC-unset}" > "$DXC_RECORD"
 exit "${UMU_EXIT:-0}"
 EOF
 chmod +x "$work/bin/umu-run"
@@ -20,8 +21,8 @@ export PATH="$work/bin:$PATH"
 export HOME="$work/home"
 export XDG_DATA_HOME="$work/data" XDG_CACHE_HOME="$work/cache"
 export VICTORY_EXE="$work/build with spaces/victory.exe"
-export LAUNCH_RECORD="$work/args" ENV_RECORD="$work/env"
-unset WINEPREFIX VKD3D_SHADER_CACHE_PATH DXVK_STATE_CACHE_PATH
+export LAUNCH_RECORD="$work/args" ENV_RECORD="$work/env" DXC_RECORD="$work/dxc"
+unset WINEPREFIX VKD3D_SHADER_CACHE_PATH DXVK_STATE_CACHE_PATH VICTORY_DXC
 
 bash "$launcher" "$work/game with spaces/title.exe" --execute --console series-s -- "argument with spaces"
 binary=${VICTORY_EXE//\//\\}
@@ -59,4 +60,15 @@ test ! -e "$work/0"
 test -d "$DXVK_STATE_CACHE_PATH"
 printf '%s\n' "$WINEPREFIX" 0 "$DXVK_STATE_CACHE_PATH" > "$work/expected"
 diff -u "$work/expected" "$ENV_RECORD"
+
+# VICTORY_DXC: unset stays unset, a Linux path goes over on Z:, a Windows
+# path is kept as it is.
+bash "$launcher" "$work/game with spaces/title.exe"
+test "$(cat "$DXC_RECORD")" = unset
+mkdir -p "$work/dxc dir"
+VICTORY_DXC="$work/dxc dir" bash "$launcher" "$work/game with spaces/title.exe"
+dxc="$work/dxc dir"
+test "$(cat "$DXC_RECORD")" = "Z:${dxc//\//\\}"
+VICTORY_DXC='C:\dxc' bash "$launcher" "$work/game with spaces/title.exe"
+test "$(cat "$DXC_RECORD")" = 'C:\dxc'
 echo 'Proton launcher checks passed.'
