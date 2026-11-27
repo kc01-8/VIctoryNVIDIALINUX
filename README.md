@@ -27,11 +27,12 @@ goes).
 ## Branches
 
 The work is not on this branch. How to build and run under Proton, and where
-things stand, are in the README of `kc/nvidia`.
+things stand, are in the README of `kc/foxhound` (and of `kc/nvidia`).
 
 | Branch | What it is |
 |---|---|
-| [`kc/nvidia`](../../tree/kc/nvidia) | **Main work.** hyphennn's NVIDIA fork plus this fork's Linux work: the Proton launcher, run scripts, memory and speed fixes for Proton |
+| [`kc/foxhound`](../../tree/kc/foxhound) | **Main work.** [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) (foxhound base), the fastest tree on NVIDIA under Windows, plus this fork's Linux work |
+| [`kc/nvidia`](../../tree/kc/nvidia) | hyphennn's NVIDIA fork plus this fork's Linux work: the Proton launcher, run scripts, memory and speed fixes for Proton, and the history of the runs |
 | [`kc/linux`](../../tree/kc/linux) | The same Linux work on top of current upstream VIctory |
 | [`kc/hlsl-probe`](../../tree/kc/hlsl-probe) | `kc/linux` plus the HLSL helper test |
 | `main` | Upstream VIctory plus this fork's repository setup (this page) |
@@ -46,6 +47,10 @@ Upstream's own README, with its commands and debugging notes, is at
   recompiler that everything here is built on.
 - **hyphennn ([fxceless/victory-fork](https://github.com/fxceless/victory-fork))**
   and the contributors to that fork: the NVIDIA work on `kc/nvidia`.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**
+  and **[foxhound](https://github.com/readmet3xt-lab/foxhound)** by
+  readmet3xt-lab, with those who contributed to them: the base of
+  `kc/foxhound`.
 - **[JMAN730/victory](https://github.com/JMAN730/victory)**: the Proton
   launcher, the smoke test, the Linux notes and the DXC fallback for the
   helper shaders, by Codex, SkippySteve, MiguVT, pablogonz12 and NiHuShu,
