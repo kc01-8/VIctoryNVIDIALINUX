@@ -613,13 +613,14 @@ struct Patch {
     ranges: Vec<(usize, usize)>,
 }
 
-/// `VICTORY_MASKED_PATCH`: 0 off (the default), 1 on, 2 in turn (`alt`).
+/// `VICTORY_MASKED_PATCH`: 0 off, 1 on (the default; run 362: waiting for the card 21 -> 2 ms, usual frame -10 ms), 2 in turn (`alt`).
 pub(crate) fn masked_patch_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_MASKED_PATCH").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     })
 }
 

@@ -1,6 +1,6 @@
 //! Mesh draws launched by the card: an amplification shader of ours
 //! (`launch.hlsl`, embedded as `launch.dxil`) in front of every translated
-//! mesh shader (`VICTORY_MESH_LAUNCH=1`; off by default: the clamp of
+//! mesh shader (`VICTORY_MESH_LAUNCH`, on by default since run 362, `0` off; before: the clamp of
 //! `crate::indirect` before each record, as before).
 //!
 //! The title draws its meshes one indirect record a call, each from the
@@ -65,13 +65,14 @@ pub(crate) fn on() -> bool {
     mode() != 0
 }
 
-/// `VICTORY_MESH_LAUNCH`: 0 off, 1 on, 2 in turn (`alt`, [`now`]).
+/// `VICTORY_MESH_LAUNCH`: 0 off, 1 on (the default; run 361: card -5 ms), 2 in turn (`alt`, [`now`]).
 fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_MESH_LAUNCH").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     })
 }
 
