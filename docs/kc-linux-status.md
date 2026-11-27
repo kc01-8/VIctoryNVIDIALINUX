@@ -80,6 +80,44 @@ T=$(ls -t "$CARGO_TARGET_DIR"/x86_64-pc-windows-gnullvm/debug/deps/load_probe-*.
 VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
 ```
 
+## Title runs under Proton (2026-11-27)
+
+RTX 3080 Ti (12 GB, driver 620.73.04), 32 GB RAM, `scripts/kc-run.sh
+--mem-max 18G --watchdog`, HUD off. Every run maps the title and binds all
+imports (`missing=0`) and reaches the menus. Memory peaked at 4–13 GB of
+the 18 GB cap; no out-of-memory kill, no NVRM Xid.
+
+| Runs | Proton | What ended them |
+|---|---|---|
+| 3, 5, 6 | UMU-Proton 11.0-2e | NVIDIA's driver crashed inside `vkCreateComputePipelines` ("Exception 0xc0000005 / 0xc000001d in Unix call"), and Wine ended the process (exit 3, reported as 247): compute shaders `4e296b1885c37b29`, then `8bb272e763f76148` |
+| 7, 8 | UMU-Proton 11.0-2e, both denied (`VICTORY_DENY_PIPELINES`) | no driver crash; the title stopped drawing and its own watchdog aborted it about 30 s later (its deliberate write to 0, `+0x23cf683`; see upstream `ff8694a6`) |
+| 10, 11 | Proton Experimental 2026-11-12 | no driver crash; the same abort about 3 minutes in, while loading. In run 11, `02384a60fda6f2d0` and `369cbe906ea72764` were refused just before (below) |
+
+**The driver crash, reproduced outside the title.** The saved shaders
+(`VICTORY_SHADER_SAVE`, kept out of the checkout), built alone with
+`victory translate <folder> --pipelines`, crash the same way. Their
+SPIR-V from UMU-Proton 11.0-2e's vkd3d-proton (build `212991fc`) fails
+`spirv-val`: one function ends in an unterminated block, the other reuses
+a merge block. Proton Experimental's (build `2576c0b4`) passes, from the
+same DXIL, and the driver builds both. So: Proton Experimental.
+
+**Wave64 programs on a 32-lane card.** vkd3d refuses a pipeline whose
+shader requires `WaveSize(64)` ("supported range is [32, 32]"). With
+`VICTORY_WAVE_WIDE=last` (profile `linux-nvidia`), `369cbe906ea72764`
+builds (checked offline with `VICTORY_HOST_MAX_WAVE=32`, which the runtime
+sets itself from the card); `02384a60fda6f2d0` is still refused (LDS in a
+group of 128, the mask as data, `v_mbcnt`, `v_readlane`). hyphennn's
+Windows runs on an RTX 4070 refused both too and went on, so these alone
+may not be what stops the title here.
+
+**Open: the abort.** It comes after about 30 s in which the process is
+nearly idle (0.1–0.2 of 16 cores) and nothing is presented; the last
+work before it is pipeline creation while loading. Next: every thread's
+stack when it happens (a diagnostics build).
+
+**Runs need no network.** The title's crash handler tried to upload its
+report; victory blocked it (`HTTP connection blocked`).
+
 ## Notes
 
 - **Runtime HLSL helpers under Proton: fixed with DXC (2026-11-26).**

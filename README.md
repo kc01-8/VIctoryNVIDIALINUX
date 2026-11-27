@@ -19,7 +19,7 @@ the game's developer or publisher, or by Microsoft.
 | Cross-building `victory.exe` on Linux | ✅ works |
 | Launcher, smoke and loader tests under Proton (no game files) | ✅ pass |
 | The GPU helper shaders under Proton (indirect draws, masked patch, card compare, card fetch) | ✅ compiled with DXC, because Wine's own compiler refuses them; their tests pass on an RTX 3080 Ti |
-| Running a title under Proton | ⚠️ not tried yet with the fix above; the next step |
+| Running a title under Proton | ⚠️ boots to the menus and loads, then the title stops itself after about 3 minutes (being traced). Needs Proton Experimental: UMU-Proton 11.0-2e crashes the driver |
 | Performance measurements on Linux | none yet |
 
 The details, with the commands that produced them, are in
@@ -42,7 +42,10 @@ as the work moves on.
 - x86-64 Linux, a CPU with AVX2, and an NVIDIA card with the proprietary
   driver. vkd3d-proton must expose Shader Model 6.6 and mesh shaders.
 - `umu-run` from [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher#installation).
-  On first launch it fetches UMU-Proton and the Steam Linux Runtime.
+- **Proton Experimental** (Steam: install "Proton Experimental"), passed
+  with `PROTONPATH`. UMU-Proton 11.0-2e's vkd3d-proton turns two of the
+  title's compute shaders into invalid SPIR-V, and NVIDIA's driver crashes
+  on it (the window just closes); Experimental's does not.
 - **DXC**, Microsoft's open-source shader compiler: `dxcompiler.dll` and
   `dxil.dll` from `bin/x64` of a
   [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases).
@@ -82,6 +85,9 @@ bash tests/proton-launcher.sh   # the launcher's argument and path handling; no 
 
 ```sh
 export VICTORY_DXC=/path/to/dxc                                     # the folder with dxcompiler.dll
+export PROTONPATH="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
+export WINEPREFIX="$HOME/.local/share/victory/proton-exp"           # its own prefix
+export VICTORY_WAVE_WIDE=last                                       # NVIDIA's 32-lane waves
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe"            # map and bind only
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe" --execute  # run it
 ```
@@ -99,10 +105,20 @@ export VICTORY_DXC=/path/to/dxc                                     # the folder
   example `Z:\home\you\dumps\title`.
 - **Don't run `winetricks d3dcompiler_47`.** That compiler is too old for
   these shaders and makes things worse. See the status doc.
+- **No pad input with Steam running?** Steam Input keeps four empty virtual
+  Xbox 360 pads that take every XInput slot. In the prefix, turn off
+  winebus's hidraw and evdev paths (`DisableHidraw`=1, `DisableInput`=1 under
+  `HKLM\System\CurrentControlSet\Services\winebus`) and set
+  `SDL_GAMECONTROLLER_IGNORE_DEVICES=0x28de/0x11ff`, so SDL hands your own
+  pad to slot 0. With no pad at all, the keyboard is one.
+- **Recorded runs.** `scripts/kc-run.sh --profile linux-nvidia --mem-max 18G
+  --watchdog TITLE.exe` runs the same with a memory cap, a freeze watchdog
+  and a run folder outside the checkout (`victory.log`, GPU and memory
+  readings, the crash log).
 
 The launcher converts a Linux `VICTORY_DXC` path to the `Z:` path that
-Wine needs. No title has been run under Proton with DXC yet, so treat a
-run as a test, not a way to play.
+Wine needs. Runs so far reach the menus and loading but do not last (see
+the status table), so treat a run as a test, not a way to play.
 
 ## Development
 
