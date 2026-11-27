@@ -33,29 +33,9 @@ const EXCEPTIONS: &[(&str, &str)] = &[(
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 
-/// Run logs: the layer's own log of a run, scrubbed of names, kept under
-/// `diagnostics/` by the owner's decision (2026-11-26; docs/asset-policy.md).
-/// A log is text we wrote, but long: these may be this large as text, and
-/// the longest are kept gzipped ([`RUN_LOG_GZ_MAX`]).
-const RUN_LOG_MAX: usize = 32 * 1024 * 1024;
-/// A gzipped run log (`diagnostics/*.txt.gz`) may be this large.
-const RUN_LOG_GZ_MAX: usize = 16 * 1024 * 1024;
-
-/// Whether `path` is a run log directly under `diagnostics/`: `Some(true)`
-/// for a gzipped one (`.txt.gz`), `Some(false)` for a text one (`.txt`).
-fn run_log(path: &str) -> Option<bool> {
-    let name = path.strip_prefix("diagnostics/")?;
-    if name.contains('/') {
-        return None;
-    }
-    if name.ends_with(".txt.gz") {
-        Some(true)
-    } else if name.ends_with(".txt") {
-        Some(false)
-    } else {
-        None
-    }
-}
+/// Logs of runs are not published in this fork (docs/asset-policy.md): they
+/// record what a title did. Nothing under this folder is accepted.
+const RUN_LOG_DIR: &str = "diagnostics/";
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
@@ -169,28 +149,8 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
-    // A run log has rules of its own: a larger size, and for a gzipped one
-    // the gzip signature instead of the text rule. (No rule on hex runs: a
-    // log quotes hashes and addresses.)
-    if let Some(gzipped) = run_log(path) {
-        let limit = if gzipped { RUN_LOG_GZ_MAX } else { RUN_LOG_MAX };
-        if content.len() > limit {
-            problems.push(format!("{} bytes exceeds the {limit}-byte limit for a run log", content.len()));
-        }
-        if gzipped {
-            if !content.starts_with(&[0x1f, 0x8b]) {
-                problems.push("a .txt.gz run log that is not a gzip stream".to_owned());
-            }
-        } else {
-            for (magic, what) in FORBIDDEN_MAGIC {
-                if content.starts_with(magic) {
-                    problems.push(format!("looks like a {what}"));
-                }
-            }
-            if content.contains(&0) {
-                problems.push("binary content (NUL bytes)".to_owned());
-            }
-        }
+    if path.starts_with(RUN_LOG_DIR) {
+        problems.push("run logs are not published here (docs/asset-policy.md)".to_owned());
         return problems;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -239,22 +199,13 @@ mod tests {
         super::run(&crate::workspace_root(), false).unwrap();
     }
 
-    /// Run logs under `diagnostics/` may be long, and gzipped; nothing else
-    /// there, nothing deeper, and nothing that is not what its name says.
+    /// Nothing under `diagnostics/` is accepted, however small or textual.
     #[test]
-    fn run_logs_have_their_own_rules() {
-        let long = vec![b'a'; 4 * 1024 * 1024];
-        assert!(check("diagnostics/run-1.txt", &long).is_empty());
-        assert!(check("diagnostics/run-1.txt.gz", &[0x1f, 0x8b, 8, 0, 0, 0]).is_empty());
-        // Not a gzip stream; binary under a text name; too long.
-        assert!(!check("diagnostics/run-1.txt.gz", b"MZ\x90\x00").is_empty());
-        assert!(!check("diagnostics/run-1.txt", b"abc\0def").is_empty());
-        assert!(!check("diagnostics/run-1.txt", &vec![b'a'; super::RUN_LOG_MAX + 1]).is_empty());
-        assert!(!check("diagnostics/run-1.txt.gz", &[&[0x1f, 0x8b][..], &vec![0u8; super::RUN_LOG_GZ_MAX][..]].concat()).is_empty());
-        // The ordinary rules everywhere else, and for other names there.
-        assert!(!check("docs/run-1.txt", &long).is_empty());
-        assert!(!check("diagnostics/deeper/run-1.txt", &long).is_empty());
-        assert!(!check("diagnostics/shot.png", b"\x89PNG").is_empty());
+    fn run_logs_are_refused() {
+        assert!(!check("diagnostics/run-1.txt", b"frame 1").is_empty());
+        assert!(!check("diagnostics/run-1.txt.gz", &[0x1f, 0x8b, 8, 0, 0, 0]).is_empty());
+        assert!(!check("diagnostics/README.md", b"# runs").is_empty());
+        assert!(check("docs/run-notes.md", b"# notes").is_empty());
     }
 
     #[test]
