@@ -164,7 +164,7 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
+    Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at, cpu: start, views: None })
 }
 
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
