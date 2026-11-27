@@ -20,6 +20,12 @@ specific build, set `VICTORY_EXE` to its Linux path. By default the launcher
 looks beside itself for `victory.exe`, then under `${CARGO_TARGET_DIR:-target}`
 for the gnullvm and MSVC release builds, in that order.
 
+Set `VICTORY_DXC` to `dxcompiler.dll`, or to the folder that holds it
+beside `dxil.dll` (from `bin/x64` of a DirectXShaderCompiler release).
+Wine's builtin `d3dcompiler_47` refuses several of the helper shaders
+compiled at runtime, so DXC compiles them instead. The launcher turns a
+Linux path into a `Z:` path.
+
 On first launch UMU fetches Proton and the Steam Linux Runtime. The default
 prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`

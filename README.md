@@ -18,7 +18,8 @@ the game's developer or publisher, or by Microsoft.
 |---|---|
 | Cross-building `victory.exe` on Linux | ✅ works |
 | Launcher, smoke and loader tests under Proton (no game files) | ✅ pass |
-| Running a title under Proton | ❌ **not yet usable.** Wine's own HLSL compiler refuses five helper shaders the GPU code compiles at runtime (indirect draws, the masked patch, the card compare). Being fixed now |
+| The GPU helper shaders under Proton (indirect draws, masked patch, card compare, card fetch) | ✅ compiled with DXC, because Wine's own compiler refuses them; their tests pass on an RTX 3080 Ti |
+| Running a title under Proton | ⚠️ not tried yet with the fix above; the next step |
 | Performance measurements on Linux | none yet |
 
 The details, with the commands that produced them, are in
@@ -42,6 +43,12 @@ as the work moves on.
   driver. vkd3d-proton must expose Shader Model 6.6 and mesh shaders.
 - `umu-run` from [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher#installation).
   On first launch it fetches UMU-Proton and the Steam Linux Runtime.
+- **DXC**, Microsoft's open-source shader compiler: `dxcompiler.dll` and
+  `dxil.dll` from `bin/x64` of a
+  [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases).
+  Put both in one folder and set `VICTORY_DXC` to that folder. Wine's own
+  HLSL compiler refuses several shaders the GPU code compiles at runtime.
+  Without DXC, indirect draws are dropped.
 - Your own dump of the title, outside this repository.
 - A Windows build of `victory.exe` (build it on Linux, below).
 
@@ -74,6 +81,7 @@ bash tests/proton-launcher.sh   # the launcher's argument and path handling; no 
 ### Run the title
 
 ```sh
+export VICTORY_DXC=/path/to/dxc                                     # the folder with dxcompiler.dll
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe"            # map and bind only
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe" --execute  # run it
 ```
@@ -92,8 +100,9 @@ bash tests/proton-launcher.sh   # the launcher's argument and path handling; no 
 - **Don't run `winetricks d3dcompiler_47`.** That compiler is too old for
   these shaders and makes things worse. See the status doc.
 
-Until the helper-shader fix lands, a run under Proton loses indirect draws
-and several GPU paths, so treat it as a test, not a way to play.
+The launcher converts a Linux `VICTORY_DXC` path to the `Z:` path that
+Wine needs. No title has been run under Proton with DXC yet, so treat a
+run as a test, not a way to play.
 
 ## Development
 
@@ -127,9 +136,10 @@ cargo xtask policy          # the same check over the whole tree
   README, with its own credits (XCL by ivall as a reference, myokex,
   Joshua Odom and others), is [docs/hyphennn-readme.md](docs/hyphennn-readme.md).
 - **[JMAN730/victory](https://github.com/JMAN730/victory)**: the Proton
-  launcher, the smoke test and the Linux notes. These are by Codex,
-  SkippySteve, MiguVT, pablogonz12 and NiHuShu, and are picked with credit in
-  each commit.
+  launcher, the smoke test, the Linux notes and the DXC fallback for the
+  helper shaders (`dffc5924`). These are by Codex, SkippySteve, MiguVT,
+  pablogonz12 and NiHuShu, and are picked or adapted with credit in each
+  commit.
 - Other community forks may be drawn on later, and are credited in the
   commits that do so.
 - This fork's changes are developed with

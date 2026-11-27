@@ -49,12 +49,10 @@ cargo test --no-fail-fast --locked $L -- --exact \
   --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib --skip image::tests::rejects_iat_outside_image
 ```
 
-Result: **52 passed, 1 failed, 4 ignored**. The failure is
-`repository_passes_policy`: two of hyphennn's source files are over the
-asset policy's 512 KiB per-file limit (`crates/victory-gpu/src/host.rs`
-560 KB, `crates/victory-shader/src/emit/lower.rs` 545 KB). The pre-commit
-hook refuses any commit that touches them. The 4 skipped tests parse the
-test executable as a PE, which is ELF on Linux.
+Result: **53 passed, 0 failed, 4 ignored** (checked 2026-11-26, after the
+policy's per-file limit went to 1 MiB: two of hyphennn's source files are
+past 512 KiB). The 4 skipped tests parse the test executable as a PE,
+which is ELF on Linux.
 
 ## Under Proton (checked 2026-11-26)
 
@@ -63,7 +61,8 @@ test executable as a PE, which is ELF on Linux.
 | `bash tests/proton-launcher.sh` (fake umu-run, no Wine) | ✅ passed |
 | `tests/proton-smoke.sh` (synthetic title, expects `title exited with 42`) | ✅ passed on UMU-Proton 11.0-2e: imports bound `hle=1 host=1 missing=0`, exit status 42 |
 | `load_probe` (gnullvm test exe + prebuilt `hle_probe.dll`, run with `umu-run`, `VICTORY_HLE_PROBE`) | ✅ 2 passed, 0 failed |
-| `hlsl_probe` (victory-gpu lib test, builtin `d3dcompiler_47`) | ❌ 5 of 5 refused, below |
+| `hlsl_probe` (victory-gpu lib test) | ✅ builtin `d3dcompiler_47` refuses 5 of 5; the runtime's path (`hlsl::compile_compute`) compiles 5 of 5 with DXC |
+| helper tests on the card (`VICTORY_TEST_ADAPTER=hardware`, RTX 3080 Ti, vkd3d-proton) | ✅ `indirect::tests::`, 20 passed: clamp, masked patch, card compare ×2, card fetch, gathered records, budget, lane order, windows, spread |
 
 `proton-smoke.sh` runs the `release/victory.exe` already built; rebuild
 it first. Proton also prints two harmless lines on a fresh prefix: it
@@ -83,12 +82,12 @@ VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
 
 ## Notes
 
-- **Runtime HLSL helpers under Proton (blocker for real runs).** This
-  tree compiles its helpers with `D3DCompile`, `cs_5_1`. Wine's builtin
-  `d3dcompiler_47` refuses five, each with E5005 (a method not defined on
-  `RWByteAddressBuffer`):
+- **Runtime HLSL helpers under Proton: fixed with DXC (2026-11-26).**
+  This tree compiles five helpers at runtime, all `cs_5_1` through
+  `D3DCompile`. Wine's builtin `d3dcompiler_47` refuses all five, each with
+  E5005 (a method not defined on `RWByteAddressBuffer`):
 
-  | Helper | Refused at | Effect at runtime |
+  | Helper | Refused at | Effect at runtime without DXC |
   |---|---|---|
   | indirect argument clamp | `clamp:198:10 'InterlockedOr'` | every indirect draw and dispatch dropped |
   | masked patch (`VICTORY_MASKED_PATCH`, default on) | `masked patch:19:33 'Load'` | the patch is not sent |
@@ -96,8 +95,19 @@ VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
   | card compare, wide (`VICTORY_CARD_HASH_WIDE`) | `card compare wide:42:59 'Load4'` | as above |
   | card fetch in flight (`VICTORY_CARD_FETCH_INFLIGHT=1`) | `card fetch in flight:27:16 'Load'` | the old fetch is used |
 
-  The depth plane's three shaders compile (checked with a local build;
-  they are private to `host.rs`, so the committed probe leaves them out).
+  They now go through `crate::hlsl::compile_compute` (after jman
+  `dffc5924`): the system's compiler first, as before, so Windows is
+  unchanged; then DXC (`cs_6_0`) from `VICTORY_DXC`. Under UMU-Proton 11.0-2e,
+  DXC compiled all five (clamp 7400, masked patch 3680, card compare 4296,
+  wide 5000, card fetch 4904 bytes), and the tests that run them on the
+  card pass (table above). `VICTORY_DXC` names `dxcompiler.dll` or its
+  folder (with `dxil.dll` beside it), from Microsoft's open-source
+  [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+  (`bin/x64`). `scripts/victory-proton.sh` turns a Linux path into the
+  `Z:` path Wine needs. Not yet tested: a real title run with it.
+
+  The depth plane's three shaders compile with the builtin (checked with a
+  local build; `host::compile` makes them with the system's compiler).
 
   `winetricks d3dcompiler_47` is **not** a fix: it installs the Windows 8.1
   SDK compiler (6.3.9600.16384), which predates Shader Model 5.1 and
@@ -105,8 +115,11 @@ VICTORY_HLE_PROBE="Z:${P//\//\\}" umu-run "Z:${T//\//\\}"
   builtin compiles. A prefix that has had that verb run needs
   `d3dcompiler_47` set back to `builtin`.
 
-  What remains: a Windows 10 or later `d3dcompiler_47.dll` (10.0.x), or one
-  shared helper-compile path through DXC (jman `dffc5924` did the clamp
-  for upstream's tree). Run the probe after either:
-  `umu-run Z:\...\victory_gpu-*.exe hlsl_probe --nocapture`, with
-  `WINEDEBUG=+loaddll` to see which compiler loaded.
+  How it was run (after `. scripts/kc-env.sh`, which sets `VICTORY_DXC`):
+
+  ```bash
+  cargo test --locked --no-run -p victory-gpu --lib --target x86_64-pc-windows-gnullvm
+  T=$(ls -t "$CARGO_TARGET_DIR"/x86_64-pc-windows-gnullvm/debug/deps/victory_gpu-*.exe | head -1)
+  umu-run "Z:${T//\//\\}" hlsl --nocapture --test-threads=1
+  VICTORY_TEST_ADAPTER=hardware umu-run "Z:${T//\//\\}" indirect::tests:: --test-threads=1
+  ```
