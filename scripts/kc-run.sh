@@ -158,6 +158,17 @@ if ((${#runner[@]})); then
     monitor & pids+=($!)
 fi
 
+# Victory's own log into the run folder: Proton Experimental launches the
+# title without a console, so its stderr does not reach run.log.
+export VICTORY_LOG_FILE="Z:${run//\//\\}\\victory.log"
+# crashes.log is kept per title under the prefix's data folder and grows
+# across runs: note its size now, copy what this run adds.
+data_dir=$WINEPREFIX/pfx/drive_c/users/steamuser/AppData/Local/victory/data
+declare -A crash_size=()
+for f in "$data_dir"/*/crashes.log; do
+    [[ -f $f ]] && crash_size[$f]=$(stat -c %s "$f")
+done
+
 args=("$title")
 [[ $dry == 1 ]] || args+=(--execute)
 args+=("$@")
@@ -177,8 +188,13 @@ if [[ $timeout_s != 0 ]]; then
 else
     "${runner[@]}" "$root/scripts/victory-proton.sh" "${args[@]}" 2>&1 | tee "$run/run.log" || status=$?
 fi
-crashes=$WINEPREFIX/pfx/drive_c/users/steamuser/AppData/Local/victory/data/crashes.log
-[[ -f $crashes ]] && cp -- "$crashes" "$run/crashes.log"
+for f in "$data_dir"/*/crashes.log; do
+    [[ -f $f ]] || continue
+    from=${crash_size[$f]:-0}
+    if (( $(stat -c %s "$f") > from )); then
+        tail -c +$((from + 1)) -- "$f" >> "$run/crashes.log"
+    fi
+done
 echo "exit      $status" >> "$run/meta.txt"
 [[ -f $run/mem-peak.txt ]] && echo "memory    $(cat "$run/mem-peak.txt") (the run's cgroup)" >> "$run/meta.txt"
 echo "run folder: $run (exit $status)"
