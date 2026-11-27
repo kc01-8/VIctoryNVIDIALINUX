@@ -34,12 +34,13 @@ files and stop. Supply them yourself if you want them.
 | | |
 |---|---|
 | Cross-building `victory.exe` on Linux (gnullvm) | ✅ builds |
-| This fork's Linux work carried over | in progress (see the branch's history) |
-| Running a title under Proton | not measured on this base yet; on `kc/nvidia` the title reaches its first scenes at 0.2–1 fps |
+| This fork's Linux work carried over | ✅ the Proton launcher and run scripts, the DXC fallback for every helper shader compiled at run time, the empty pipeline library, the watchdog hook, windows of title memory read in place (those over the page pool too), BCPack tables supplied by the user |
+| Running a title under Proton | ⚠️ 3–5.6 frames a second at 1,600–2,400 draws (run 36), at 12–13 GB that cannot be reclaimed; every pipeline made apart from the ray-tracing passes this tree leaves out and one compute program that does not translate; runs stop on their own after 1.5–10 minutes (below) |
 
-The goal: every shader made, then 60 frames a second. trustno1's tree runs
-26–30 frames a second at 1440p on an RTX 5070 under Windows; hyphennn's
-tree (`kc/nvidia`) 8–11.
+What runs 33–36 measured, and what is open, is in
+[docs/kc-linux-status.md](docs/kc-linux-status.md). The goal: every shader
+made, then 60 frames a second. trustno1's tree runs 26–30 frames a second
+at 1440p on an RTX 5070 under Windows.
 
 ## Branches
 
