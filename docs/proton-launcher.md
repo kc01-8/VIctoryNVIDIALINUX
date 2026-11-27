@@ -25,6 +25,14 @@ prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
 
+The launcher creates shader-cache directories at
+`${XDG_CACHE_HOME:-$HOME/.cache}/victory/vkd3d` and
+`${XDG_CACHE_HOME:-$HOME/.cache}/victory/dxvk`, keeping generated caches out
+of the checkout. `VKD3D_SHADER_CACHE_PATH` and `DXVK_STATE_CACHE_PATH`
+override these defaults. `VKD3D_SHADER_CACHE_PATH=0` disables the VKD3D cache
+without creating a directory. Empty or relative XDG base directories fall back
+to the standard directories under `$HOME`.
+
 ## Building with LLVM-MinGW
 
 Install Rust with rustup and put the x86-64 Linux UCRT distribution of
@@ -37,6 +45,10 @@ cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
 ```
 
 ## Testing without game files
+
+`bash tests/proton-launcher.sh` checks argument quoting, cache paths, XDG
+fallbacks and exit status with a fake UMU. It requires neither Wine nor a GPU,
+and runs in Linux CI.
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
 toolchain and gnullvm Rust target above, even when `VICTORY_EXE` points to
