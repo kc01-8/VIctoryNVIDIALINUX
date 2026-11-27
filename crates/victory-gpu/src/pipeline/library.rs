@@ -451,7 +451,13 @@ fn library() -> Option<&'static Library> {
                 tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
                 return None;
             }
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let device = match crate::host::host()?.device.cast::<ID3D12Device1>() {
+                Ok(device) => device,
+                Err(e) => {
+                    tracing::warn!(error = %e, "no ID3D12Device1: no host pipeline library");
+                    return None;
+                }
+            };
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -466,9 +472,24 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // An empty library is asked for with no blob (a null pointer), not
+        // an empty slice, whose pointer is never null: vkd3d-proton refuses
+        // a zero length with a pointer (E_INVALIDARG), so under Proton no
+        // library was made and nothing was kept or started early.
+        let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); the out
+        // pointer is ours and holds a new reference on success.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                blob,
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(raw).cast()
         }
     };
     let mut rejected = false;
@@ -510,7 +531,13 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
             tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
         }
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::warn!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -538,11 +565,17 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    let began = std::time::Instant::now();
+    // Each pipeline's name and how long the host took: the name is the
+    // same in every run for the same description, so two runs' lines show
+    // whether a build that took long twice was the same pipeline.
+    let ms = || began.elapsed().as_millis() as u64;
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let made = create();
+        tracing::info!(name, ms = ms(), "host pipeline made (no library)");
+        return made;
     };
-    let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
@@ -555,6 +588,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(name, ms = ms(), "host pipeline loaded from the library");
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -569,6 +603,7 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(name, ms = ms(), "host pipeline made (not in the library)");
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
