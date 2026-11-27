@@ -1538,7 +1538,7 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(2000 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -1577,7 +1577,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(96, |percent| percent.clamp(50, 97))
     })
 }
 

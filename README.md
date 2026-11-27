@@ -28,11 +28,11 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 23:15 UTC)
+## Status of this fork (2026-11-27, 00:30 UTC)
 
-**Playable, slowly: about 7.5 to 8.5 world frames per second at the first boat mission at 3,300 to
-4,100 draws (the console runs 30), 10 to 14 in lighter views. The graphics card is the limit: about 80 ms
-of card time a frame. The tester has played from the opening through the prologue and past
+**Playable, slowly: about 8.8 world frames per second at the first boat mission at 3,300 to 4,100
+draws (usual frame 113 ms, the card 71 ms of it; the console runs 30), 10 to 14 in lighter views. The
+open water now shows waves and the sun's path with no black patches. The tester has played from the opening through the prologue and past
 the first boat mission. The graphics card is still lost now and then 30 to 50 minutes into a session,
 before the title's next save point; cause not known yet. Shadowed areas are still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
@@ -44,13 +44,35 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
 | Saves | the game autosaves a checkpoint and loads it again; test runs continue from the last checkpoint |
 | The prologue and the first missions | play: characters, textures, sky, sunlit exteriors, vehicles and boats; HUD, pause menu and pad input work. Played past the first boat mission (2026-11-25) |
-| Water | right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
+| Water | **2026-11-27: no black or grey patches on open water** once the two 64-lane water programs (5dc3b25986622949, 6f225b641c5b0708) are no longer forced into the wave-wide form (leave them out of `VICTORY_WAVE_WIDE_ONLY`). Before: right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
 | Frame rate in the world | **2026-11-26 evening: usual world frame 131 ms at 3,300 to 4,100 draws with the card at 80 ms a frame (card hashing a group of 64 threads a piece, now the default; 149 ms and 108 ms of card without it, run 349).** Earlier: 8.2 to 8.6 world frames a second at the first boat mission at 3,000 to 5,000 draws, 9.5 over a whole standing run** (runs 311, 312, 315, 316: frames counted only where every frame is a world frame, not fades or loading screens), with the texture pass on its own thread (`VICTORY_HEAP_WORKER=1`; 6.2 to 6.7 without it). 10 to 14 fps at 500 to 1,500 draws. The thread that prepares submissions is the limit (about 70 ms of a usual frame); the card is at work about 9 ms. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md`; the defaults are slower |
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 23:15 UTC)
+### Newest (2026-11-27, 00:30 UTC)
+
+- **Measured (one run, 3,300 to 4,100 draws): usual world frame 113 ms, the card 71 ms** with the
+  wide raw loads guarded at a view's end, the fast-math flag off, the 4 MiB window grid, joins of 4
+  parts and 48 lists, texture room 90 % with 3,072 MB kept for targets, and the kept thread pool.
+- **Water:** the black and grey patches came from forcing the two water programs into the wave-wide
+  form. Left out, open water shows waves and the sun's path.
+- **Translator (shader caches must be rebuilt; keep `early-pipelines.txt`):** wide raw loads are on by
+  default and fall back to one load a dword where four would pass a heap view's end; `ds_bpermute`
+  reads within its own 32-lane half (after Belobug PR #363); pixel-shader quad swizzles read through
+  quad operations (after Belobug 03629f3f); a helper lane's first-lane read is its own value (after
+  upstream 0601955); NaN tests are made on the bits; `VICTORY_SHADER_FAST_BITS` picks the fast-math
+  flags (still off: all flags gave black blotches); ray node tests answer "no hit" by default
+  (`VICTORY_BVH_NO_HIT=0` off).
+- **Merged by hand:** #1397 (paired wave64 lowering, off; per program with `VICTORY_WAVE_PAIRS_ONLY`;
+  both water programs are refused by it today: "a floating-point reduction without an exact paired
+  tree"), #1399 (one GPU-write step per range per list), #1400 (lock-free empty slots, one-block
+  write faults, root constants on the stack), and a switch for #1392 (`VICTORY_NO_WAIT_PARTIAL=0`).
+- **New, off by default:** `VICTORY_CARD_FILLS` (constant buffers and copies where shaders wrote, on
+  the card; measured worse: usual frame +11 ms, card +6 ms), `VICTORY_MESH_LAUNCH` (#1381's idea,
+  from its HLSL), and a kept pool for the texture checks ahead (`VICTORY_KEPT_THREADS=0` off).
+
+### Earlier (2026-11-26, 23:15 UTC)
 
 - **Card hashing a group of 64 threads a piece is now the default (`VICTORY_CARD_HASH_WIDE=0` for the
   old form):** the card's time a frame 80 ms against 108 ms at 3,300 to 4,100 draws, the usual world

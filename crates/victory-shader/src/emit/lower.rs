@@ -30,6 +30,9 @@ pub(super) mod intersect;
 #[path = "halves.rs"]
 mod halves;
 
+#[path = "paired.rs"]
+mod paired;
+pub(super) use paired::{accesses_lds, supports_paired_lds};
 /// Threads past a `DispatchX` thread count (`USER_DISPATCH_THREADS`), a
 /// child module so it shares the emitter's state (fork pull request #646).
 #[path = "dispatch_threads.rs"]
@@ -74,6 +77,12 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Wide raw loads given a bounds check (`raw_dwords`).
+    #[cfg(test)]
+    pub guarded_wide_loads: u32,
+    /// Quad-local reads written through quad operations (`quad_read`).
+    #[cfg(test)]
+    pub quad_reads: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -320,7 +329,26 @@ struct Lower<'a> {
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
+    twin: Option<Box<LaneState>>,
+    upper: bool,
+    lds_last: Option<bool>,
+    lane_scalars: HashSet<Value>,
     abort: Option<usize>,
+}
+
+#[derive(Default)]
+struct LaneState {
+    vals: HashMap<Value, Val>,
+    floats: HashMap<Value, V>,
+    bools: HashMap<(usize, Bool), V>,
+    lane_bits: HashMap<Value, V>,
+    lane_fail: HashMap<Value, Why>,
+    mask_phis: HashMap<Value, V>,
+    pending_masks: Vec<(V, usize, usize)>,
+    data_phis: Vec<(V, usize, usize)>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    strides: HashMap<(usize, Site, u8), V>,
+    clane: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -362,12 +390,16 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
+/// separates it from the entry or makes it run a different number of times.
+/// None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    all_lane_blocks_with_loop_exits(st, false)
+}
+
+fn all_lane_blocks_with_loop_exits(st: &Structured, loop_exits: bool) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
+    for (_, region) in lane_regions(st, loop_exits)? {
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
@@ -376,9 +408,9 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
+/// not post-dominate it and the natural loops it leaves. Not wave-wide branches
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+fn lane_regions(st: &Structured, loop_exits: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -416,6 +448,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             }
         }
     }
+    let loops = if loop_exits { natural_loops(&succ) } else { Vec::new() };
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
@@ -432,18 +465,38 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
+        // A per-lane exit leaves only some lanes to revisit its loop, even
+        // when the exiting block post-dominates itself. Adapted from fork PR #993.
+        for body in loops.iter().filter(|body| body[d] && succ[d].iter().any(|&s| !body[s])) {
+            for (divergent, &member) in seen.iter_mut().zip(body) {
+                *divergent |= member;
+            }
+        }
         regions.push((d, seen));
     }
     Some(regions)
+}
+
+#[path = "loop_regions.rs"]
+mod loop_regions;
+use loop_regions::natural_loops;
+
+pub(super) fn loop_exits_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
 /// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
+#[cfg(test)]
 pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    branches_around_with_loop_exits(st, needs, false)
+}
+
+pub(super) fn branches_around_with_loop_exits(st: &Structured, needs: &[usize], loop_exits: bool) -> Option<Vec<usize>> {
     let mut out = Vec::new();
-    for (d, region) in lane_regions(st)? {
+    for (d, region) in lane_regions(st, loop_exits)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
@@ -542,6 +595,17 @@ enum Wave {
     Base,
     /// A mix the idiom does not make.
     Mixed,
+}
+
+pub(super) fn crosses_halves(p: &Program, st: &Structured) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let n = i.name();
+        n.starts_with("v_mbcnt")
+            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+            || n.starts_with("ds_permute")
+            // `ds_bpermute` reads within its own 32-lane half (Belobug #363).
+            || reads_mask_as_data(st, i)
+    }) || lane_constant_masks(st) || !st.wide.is_empty()
 }
 
 /// Whether a console wave64 program may run with each host wave as a wave of its own
@@ -862,6 +926,35 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
+    let mut own: HashSet<Value> = res.waterfall.reads.iter().copied().collect();
+    if own.is_empty() {
+        return own;
+    }
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    loop {
+        let before = own.len();
+        for &b in &order {
+            let block = &p.blocks[b];
+            for phi in &block.phis {
+                if !matches!(phi.reg, Reg::V(_)) && phi.args.iter().any(|a| own.contains(a)) {
+                    own.insert(phi.value);
+                }
+            }
+            for inst in &block.insts {
+                if matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
+                    && inst.reads.iter().any(|r| own.contains(&r.1))
+                {
+                    own.extend(inst.writes.iter().map(|w| w.1));
+                }
+            }
+        }
+        if own.len() == before {
+            return own;
+        }
+    }
+}
+
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -1255,6 +1348,15 @@ pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: a raw load of several dwords is written as a host that checks
+    /// such a call as a whole would run it, all its dwords 0 when any lies
+    /// past the view's end (the behaviour the bounds check of `raw_dwords`
+    /// guards against), so the software adapter shows what such a card gives.
+    pub(super) static WHOLE_CALL_ZEROS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1262,6 +1364,20 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_paired_lanes`].
+    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Paired Wave64 lowering adapted from PiloteCode #854 and darkworldhm 840243e2.
+pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAIRED.set(self.0);
+        }
+    }
+    let _restore = Restore(PAIRED.replace(true));
+    f()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1585,7 +1701,20 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
-        if let StageIo::Cs(cs) = x.native.io {
+        let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
+        if let StageIo::Cs(cs) = x.native.io
+            && paired
+        {
+            let waves = cs.threads.iter().product::<u32>() / 64;
+            s.threads = Some([32 * waves, 1, 1]);
+            s.lds_dwords = cs.lds_bytes() / 4;
+            if waves > 1 {
+                halves = Some(s.lds_dwords);
+                s.lds_dwords += 1;
+            }
+            console_lanes = true;
+            s.wave_size = Some(32);
+        } else if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
@@ -1607,22 +1736,14 @@ impl<'a> Lower<'a> {
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
-            // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, `ds_bpermute`, which the ISA
+            // confines there – runs exactly in waves of 32: the thread relabelling makes each host
+            // wave one half of a console wave (lanes 32k..32k+31). Not when it crosses halves
+            // (`v_mbcnt`, `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
-                    let n = i.name();
-                    n.starts_with("v_mbcnt")
-                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                        || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
-                        || reads_mask_as_data(x.st, i)
-                }) || lane_constant_masks(x.st)
-                    || !x.st.wide.is_empty();
+                let crosses = crosses_halves(p, x.st);
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {
@@ -1636,7 +1757,7 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(all) = all_lane_blocks_with_loop_exits(x.st, loop_exits_on()) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -1679,8 +1800,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -1695,7 +1816,7 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
+                        match all_lane_blocks_with_loop_exits(x.st, loop_exits_on()) {
                             None => why.push("an indirect exit"),
                             Some(all) if lds_meetings(p, x.st, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
@@ -1737,7 +1858,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .enumerate()
                 .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
-            let all = all_lane_blocks(x.st);
+            let all = all_lane_blocks_with_loop_exits(x.st, x.native.stage == HwStage::Cs && x.native.wave64 && host_max_wave() == 32 && loop_exits_on());
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
                 .filter(|&b| {
@@ -1907,6 +2028,10 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            twin: paired.then(Box::default),
+            upper: false,
+            lds_last: None,
+            lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
         }
     }
 
@@ -2040,7 +2165,7 @@ impl<'a> Lower<'a> {
             }
         };
         if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
-            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+            for (k, x) in self.raw_dwords(h, off, n, false).into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -2559,6 +2684,12 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if self.twin.is_some() {
+            self.swap_lanes();
+            let r = self.inputs();
+            self.swap_lanes();
+            r?;
+        }
         // A compute program that reads its group id x may run spread across
         // z (`USER_DISPATCH_SPREAD`). Not a spilled one (the builder's
         // stages, near the root signature's 64 dwords), nor one whose first
@@ -2590,32 +2721,30 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
+            self.block_phis(b);
+            if self.twin.is_some() {
+                self.swap_lanes();
+                self.block_phis(b);
+                self.swap_lanes();
             }
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
+            self.lds_last = None;
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
+                if self.twin.is_some() {
+                    self.paired_inst(b, i)?;
+                } else {
+                    self.inst(b, i)?;
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        if self.twin.is_some() {
+                            self.paired_section_inst(b, j, i);
+                        } else {
+                            self.section_inst(b, j, i);
+                        }
                     }
                     i = end;
                     continue;
@@ -2630,6 +2759,19 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // (the paired form: the other lane's joins too; filling one lane's can ask for lane
+        // masks joined in either lane, until neither has any left)
+        while self.twin.is_some() {
+            self.swap_lanes();
+            let r = self.fill_phis();
+            self.swap_lanes();
+            r?;
+            let left = self.twin.as_deref().is_some_and(|t| !t.pending_masks.is_empty());
+            if self.pending_masks.is_empty() && !left {
+                break;
+            }
+            self.fill_phis()?;
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2648,11 +2790,38 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
+            guarded_wide_loads: self.s.guarded_wide_loads,
+            #[cfg(test)]
+            quad_reads: self.s.quad_reads,
+            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
         })
+    }
+
+    /// The joins at the start of IR block `b`, filled once every block is lowered
+    /// ([`Self::fill_phis`]).
+    fn block_phis(&mut self, b: usize) {
+        let p = self.x.p;
+        for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+            let val = match phi.reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                Reg::Scc => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.data_phis.push((v, b, i));
+                    Val::Bit(v)
+                }
+                _ => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i32);
+                    self.data_phis.push((v, b, i));
+                    Val::I32(v)
+                }
+            };
+            self.vals.insert(phi.value, val);
+        }
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -2814,14 +2983,14 @@ impl<'a> Lower<'a> {
         let keep = self.s.m.bin(e, Bin::Or, unspread, in_x);
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
         for (&v, &inp) in &io_inputs {
-            match inp {
-                Input::GroupId(0) => {
-                    self.vals.insert(v, Val::I32(eff_x));
-                }
-                Input::GroupId(2) => {
-                    self.vals.insert(v, Val::I32(eff_z));
-                }
-                _ => {}
+            let value = match inp {
+                Input::GroupId(0) => Val::I32(eff_x),
+                Input::GroupId(2) => Val::I32(eff_z),
+                _ => continue,
+            };
+            self.vals.insert(v, value);
+            if let Some(twin) = &mut self.twin {
+                twin.vals.insert(v, value);
             }
         }
         let body = self.s.m.new_block();
@@ -3520,9 +3689,11 @@ impl<'a> Lower<'a> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block.
+        // host waves know every lane runs that block, and in the paired form, whose host wave
+        // runs every block with all its lanes.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        let whole = self.twin.is_some()
+            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
@@ -3541,9 +3712,14 @@ impl<'a> Lower<'a> {
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
-                let bit = self.boolean(m, at);
+                // (the paired form: the upper lanes' bits too, lanes 32-63)
+                let bits = if self.twin.is_some() {
+                    self.both(|l| l.boolean(m, at)).map(|[a, b]| (a, Some(b)))
+                } else {
+                    self.boolean(m, at).map(|a| (a, None))
+                };
                 self.balloting.remove(&lo);
-                let mut bit = bit?;
+                let (mut bit, upper) = bits?;
                 if let Some(active) = self.partial_active
                     && self.x.st.active.contains(&lo)
                 {
@@ -3556,7 +3732,10 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                if self.exchange.is_some() {
+                if let Some(upper) = upper {
+                    let r = self.s.op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[upper]);
+                    xy.1 = self.s.m.extract(at, r, 0);
+                } else if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
                     if self.local {
@@ -4081,10 +4260,11 @@ impl<'a> Lower<'a> {
     }
 
     /// A console wave64 program in host waves of 32: the first console thread of this host wave
-    /// (0, 32, 64, ...). A GPU need not give a host wave consecutive thread indices (NVIDIA's
-    /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter instead: every thread
-    /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
-    /// found. Branch-free, in the entry block, which every thread runs.
+    /// (0, 32, 64, ...; in the paired form 0, 64, 128, ...). A GPU need not give a host wave
+    /// consecutive thread indices (NVIDIA's 8 x 8 groups), so each wave takes the next 32 (64)
+    /// from an LDS counter instead: every thread zeroes it, the group meets, each wave's first
+    /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
+    /// which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
@@ -4095,12 +4275,16 @@ impl<'a> Lower<'a> {
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
+        if self.twin.is_some() {
+            self.s.m.atomic(e, Rmw::Xchg, ptr, zero);
+        } else {
+            self.s.m.store(e, ptr, zero);
+        }
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        let step = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
+        let add = self.s.m.select(e, first, step, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
@@ -4110,10 +4294,20 @@ impl<'a> Lower<'a> {
     }
 
     /// The console thread index of this thread in the group: `wave_base` plus the host lane
-    /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
+    /// (host waves of 32), else the wave's first thread index rounded down plus the lane. In
+    /// the paired form, of the lane being lowered: its console wave's first thread, plus the
+    /// host lane, plus 32 for the upper lane.
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        if self.twin.is_some() {
+            let half = self.s.m.i32(if self.upper { 32 } else { 0 });
+            let t = self.s.m.bin(e, Bin::Add, lane, half);
+            return match self.wave_base() {
+                Some(base) => self.s.m.bin(e, Bin::Add, base, t),
+                None => t,
+            };
+        }
         if let Some(base) = self.wave_base() {
             return self.s.m.bin(e, Bin::Add, base, lane);
         }
@@ -4126,9 +4320,10 @@ impl<'a> Lower<'a> {
     }
 
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
-    /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane.
+    /// wave holds a 32-aligned run of console lanes (in the paired form, the lane being
+    /// lowered). Without `exchange` or the paired form: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() {
+        if self.exchange.is_none() && self.twin.is_none() {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -4220,19 +4415,28 @@ impl<'a> Lower<'a> {
     /// console wave has its bit of the result, asked where the operation stands. The lanes
     /// that are elsewhere have no bit (the result is ANDed with EXEC or is EXEC), so with
     /// the console's waves the host wave's answer is the console's; two host waves of 32
-    /// exchange theirs, which needs every lane there.
+    /// exchange theirs, which needs every lane there. In the paired form the host wave asks
+    /// both lanes of each thread.
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
+        let made = self.def_block.get(&scc).copied();
+        let at = |l: &Self| match made {
+            None => Ok(l.body_entry),
+            Some(b) if b == l.cur_ir => Ok(l.cur),
+            Some(b) => l.tail[b].ok_or("a lane mask written after its use"),
+        };
+        if self.twin.is_some() {
+            let at = at(self)?;
+            let [lo, hi] = self.both(|l| l.boolean(m, at))?;
+            let either = self.s.m.bin(at, Bin::Or, lo, hi);
+            self.s.flags |= flags::WAVE_OPS;
+            return Ok(self.s.op(at, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[either]));
+        }
         // (not for a console wave cut into host waves that do not exchange)
         if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
         }
-        let made = self.def_block.get(&scc).copied();
-        let at = match made {
-            None => self.body_entry,
-            Some(b) if b == self.cur_ir => self.cur,
-            Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
-        };
+        let at = at(self)?;
         let mut bit = self.boolean(m, at)?;
         if let Some(active) = self.partial_active {
             bit = self.s.m.bin(at, Bin::And, bit, active);
@@ -4257,6 +4461,18 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
+        if self.twin.is_some() {
+            // The paired form: the host wave is the console's, each thread with two of its
+            // lanes; every lane is here (control flow is the wave's), and a lane outside EXEC
+            // says what it says on the console (no set bit for "some lane", no objection to
+            // "every lane").
+            let c = self.cur;
+            let [lo, hi] = self.both(|l| l.boolean(when, c))?;
+            let pair = self.s.m.bin(c, if any { Bin::Or } else { Bin::And }, lo, hi);
+            self.s.flags |= flags::WAVE_OPS;
+            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+            return Ok(self.s.op(c, name, Attr::NoUnwind, self.s.t.i1, code, &[pair]));
+        }
         if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
@@ -4318,7 +4534,7 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() {
+        let lane = if self.exchange.is_some() || self.twin.is_some() {
             self.console_lane()
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
@@ -4552,15 +4768,20 @@ impl<'a> Lower<'a> {
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
+    /// wave-aligned run of flat ids, as the console's waves do.) In the paired form, of the
+    /// console lane being lowered, in the console's group (the host's is a row of half as
+    /// many threads).
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = match self.x.native.io {
+            StageIo::Cs(cs) => cs.threads,
+            _ => self.s.threads.expect("compute"),
+        };
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.twin.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -4748,6 +4969,49 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// `x` of lane `src` of this lane's quad, where lane `q` of each quad
+    /// reads lane `pattern[q]` of it (`src` is that lane's index in the
+    /// wave), for a quad-local swizzle or DPP `quad_perm`: in a pixel
+    /// shader and in a mesh shader through quad reads, else through a wave
+    /// read. In a pixel shader the quad's other pixels at a triangle's edge
+    /// are helper lanes, which wave operations leave out (DXIL without
+    /// `WaveOpsIncludeHelperLanes`): a wave read of one gives what the host
+    /// likes (0 on AMD), so a derivative taken by hand was the whole value
+    /// there, the texture read that used it took its smallest level, and
+    /// triangle edges showed as lines on car paint, glass and skin (from
+    /// Belobug 03629f3f). Quad reads see helper lanes. A pattern that is a
+    /// broadcast or a swap across x, y or the diagonal takes one quad read.
+    fn quad_read(&mut self, x: V, src: V, pattern: [u32; 4]) -> V {
+        let quads = self.s.mesh.is_some() || self.s.pixel;
+        if !quads {
+            return self.read_lane(x, src);
+        }
+        #[cfg(test)]
+        {
+            self.s.quad_reads += 1;
+        }
+        let p = pattern.map(|k| k & 3);
+        if p == [0, 1, 2, 3] {
+            return x;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        if p.iter().all(|&k| k == p[0]) {
+            self.s.flags |= flags::WAVE_OPS;
+            let k = self.s.m.i32(p[0]);
+            return self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, i32t, 122, &[x, k]);
+        }
+        // QuadOpKind: 0 across x (lane ^ 1), 1 across y (^ 2), 2 diagonal (^ 3).
+        for (kind, flip) in [(0u8, 1u32), (1, 2), (2, 3)] {
+            if (0..4).all(|q| p[q as usize] == q ^ flip) {
+                self.s.flags |= flags::WAVE_OPS;
+                let k = self.s.m.i8(kind);
+                return self.s.op(c, "quadOp.i32", Attr::NoUnwind, i32t, 123, &[x, k]);
+            }
+        }
+        self.quad_pick(x, src)
+    }
+
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -4776,6 +5040,30 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead (upstream 0601955).
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL without
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane (upstream measured
+    /// draws of 0.3 to 1.3 s each, then DEVICE_HUNG). With its own value a
+    /// helper lane matches in the first pass and leaves; what a helper lane
+    /// computes only feeds derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -4874,8 +5162,15 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
+            let r = if quad {
+                // lane q of a quad reads lane pattern[q] of it
+                let pattern = if offset & 0x8000 != 0 {
+                    [0, 1, 2, 3].map(|q| offset >> (2 * q) & 3)
+                } else {
+                    let (and, or, xor) = (offset & 0x1F, offset >> 5 & 0x1F, offset >> 10 & 0x1F);
+                    [0, 1, 2, 3].map(|q| ((q & and) | or) ^ xor)
+                };
+                self.quad_read(x, src, pattern)
             } else {
                 self.read_lane(x, src)
             };
@@ -4885,28 +5180,37 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
+            // register of the lane its address names, (address + offset) / 4,
+            // within its own 32-lane half: GFX10 permutes the two halves of a
+            // wave of 64 on their own (RDNA ISA; LLVM's
+            // `supportsWaveWideBPermute` is false for wave64 from GFX10 on,
+            // and Mesa ACO's `emit_bpermute` emulates a wave-wide one). So
+            // lane l reads lane (l & 32) | (that & 31): in the same host wave
+            // on a host of 32 lanes too, where each host wave is one half of
+            // the console's (from Belobug PR #363). A source lane outside EXEC
+            // gives 0. (The title's checkerboard shadow-mask
+            // generators read their neighbours' samples with it; without them
+            // every shadowed light was multiplied by an empty mask.)
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let k31 = self.s.m.i32(31);
+            let mut src = self.s.m.bin(c, Bin::And, src, k31);
+            if self.wave() == 64 {
+                // The lane's own half: bit 5 of its host lane, which is 0 in
+                // a host wave of 32 (one half of the console's wave).
+                let lane = self.lane_index();
+                let k32 = self.s.m.i32(32);
+                let half = self.s.m.bin(c, Bin::And, lane, k32);
+                src = self.s.m.bin(c, Bin::Or, src, half);
+            }
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -4919,20 +5223,29 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        let paired_lds = match self.x.native.io {
+            StageIo::Cs(cs) if self.twin.is_some() => Some(cs.lds_bytes() / 4),
+            _ => None,
+        };
+        if paired_lds.unwrap_or(self.s.lds_dwords) == 0 {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let index = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
-            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            l.s.m.bin(c, Bin::LShr, at, two)
+        };
+        if let Some(dwords) = paired_lds {
+            return self.paired_lds(inst, a, guard, dwords);
+        }
+        // Shortcut: other modes take LDS addresses as dword-aligned and in bounds.
+        let dword = |l: &mut Self, bytes: u32| -> V {
+            let index = index(l, bytes);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            l.s.m.element(l.cur, lds, index)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5266,6 +5579,7 @@ impl<'a> Lower<'a> {
                 // Without the wait for the group (bit 0) where not every
                 // lane arrives, or where the switch says so.
                 let waits = match super::group_sync() {
+                    _ if self.twin.is_some() => true,
                     0 => false,
                     1 => !self.fence_only.contains(&b),
                     _ => true,
@@ -5917,7 +6231,7 @@ impl<'a> Lower<'a> {
     }
 
     /// `count` dwords from byte `addr` on of the raw view `h`, as integers,
-    /// read in the current block by one call for every four of them
+    /// read by one call for every four of them
     /// ([`Self::wide_loads`]). They are the dwords of ONE console load,
     /// which the console reads as one (address plus 4, 8, ... without
     /// wrapping at 32 bits): the same bytes as a call a dword reads. Loads
@@ -5925,27 +6239,94 @@ impl<'a> Lower<'a> {
     /// computes their offsets in 32-bit registers, and `x - 4` and `x` at
     /// `x = 0` are one dword out of the view and its first one, where one
     /// call from `x - 4` on would read both out of it.
-    fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
-        let c = self.cur;
+    ///
+    /// `bounded`: `h` is a view from the heap, which the host bounds-checks
+    /// (a root view read by address has no bounds and needs no check). The
+    /// console checks each dword on its own; a host may check a call of
+    /// several dwords as a whole and answer ZEROS for all of them when only
+    /// the last lies past the view's end (the lead for run 277's black
+    /// water). So a call of two to four dwords on a bounded view runs only
+    /// where all of them lie inside the view's bytes (`getDimensions`, the
+    /// width in bytes of a raw view); elsewhere the dwords are read by a
+    /// call each, as without the wide loads. A view whose width the host
+    /// counts in elements (a typed or structured view read as raw) gives a
+    /// width no larger than its bytes: such calls take the dword calls more
+    /// often, never wrongly the wide one. Ends in a new current block when
+    /// it checks.
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32, bounded: bool) -> Vec<V> {
         let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let size = (bounded && count > 1).then(|| {
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, u]);
+            self.s.m.extract(c, d, 0)
+        });
         let mut out = Vec::with_capacity(count as usize);
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
+            let c = self.cur;
             let off = self.s.m.i32(4 * first);
             let a = self.s.m.bin(c, Bin::Add, addr, off);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, a, u, mask, al],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, k);
-                out.push(self.as_int(x));
+            let call = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+                let b = l.cur;
+                let mask = l.s.m.i8((1u8 << n) - 1);
+                let r = l.s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139, &[h, at, u, mask, al]);
+                #[cfg(test)]
+                let whole = (n > 1 && WHOLE_CALL_ZEROS.get()).then(|| {
+                    let i32t = l.s.t.i32;
+                    let dims = l.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let d = l.s.op(b, "getDimensions", Attr::ReadOnly, dims, 72, &[h, u]);
+                    let width = l.s.m.extract(b, d, 0);
+                    let bytes = l.s.m.i32(4 * n);
+                    let end = l.s.m.bin(b, Bin::Add, at, bytes);
+                    l.s.m.cmp(b, pred::IUGT, end, width)
+                });
+                (0..n)
+                    .map(|k| {
+                        let x = l.s.m.extract(b, r, k);
+                        let x = l.as_int(x);
+                        #[cfg(test)]
+                        let x = match whole {
+                            Some(past) => {
+                                let z = l.s.m.i32(0);
+                                l.s.m.select(b, past, z, x)
+                            }
+                            None => x,
+                        };
+                        x
+                    })
+                    .collect()
+            };
+            let Some(size) = size.filter(|_| n > 1) else {
+                out.extend(call(self, a, n));
+                continue;
+            };
+            // Inside: a + 4n neither wraps nor passes the width.
+            let bytes = self.s.m.i32(4 * n);
+            let end = self.s.m.bin(c, Bin::Add, a, bytes);
+            let fits = self.s.m.cmp(c, pred::IULE, end, size);
+            let no_wrap = self.s.m.cmp(c, pred::IUGE, end, a);
+            let inside = self.s.m.bin(c, Bin::And, fits, no_wrap);
+            let yes = self.s.m.bool(true);
+            let outside = self.s.m.bin(c, Bin::Xor, inside, yes);
+            #[cfg(test)]
+            {
+                self.s.guarded_wide_loads += 1;
             }
+            let zero = self.s.m.i32(0);
+            let at = self.begin_guarded(Some(inside));
+            let wide: Vec<(V, V)> = call(self, a, n).into_iter().map(|x| (x, zero)).collect();
+            let wide = self.end_guarded(at, &wide);
+            let at = self.begin_guarded(Some(outside));
+            let mut each = Vec::with_capacity(n as usize);
+            for (k, &w) in wide.iter().enumerate() {
+                let b = self.cur;
+                let four = self.s.m.i32(4 * k as u32);
+                let ak = self.s.m.bin(b, Bin::Add, a, four);
+                each.push((call(self, ak, 1)[0], w));
+            }
+            out.extend(self.end_guarded(at, &each));
         }
         out
     }
@@ -6033,7 +6414,7 @@ impl<'a> Lower<'a> {
             let mut raw = Vec::new();
             let wide = Self::wide_loads();
             if wide {
-                let dwords = self.raw_dwords(h, addr, count);
+                let dwords = self.raw_dwords(h, addr, count, true);
                 raw.extend(dwords.into_iter().map(|x| (x, zero)));
             }
             for k in 0..if wide { 0 } else { count } {
@@ -6075,7 +6456,7 @@ impl<'a> Lower<'a> {
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             if Self::wide_loads() {
-                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                for (k, x) in self.raw_dwords(h, addr, count, !matches!(src, Source::Built { .. })).into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
@@ -7017,6 +7398,10 @@ impl<'a> Lower<'a> {
                 let clear = self.lane_heap_index(b, sampler)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
             }
+            // (in the paired form a thread comes the wave's way, not each lane its own)
+            Source::LanePhi { .. } if self.twin.is_some() => {
+                Err("a per-lane descriptor chosen by the lanes' ways, in paired lanes")
+            }
             Source::LanePhi { block, args } => {
                 // Each predecessor computes its heap index at its end (what
                 // it reads is there: the dwords are, on that edge); the join
@@ -7262,10 +7647,12 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
-        } else {
-            self.read_lane(x, src)
+        let mut r = match dpp {
+            Dpp::Row { ctrl: ctrl @ 0..=0xFF, .. } => {
+                let ctrl = u32::from(ctrl);
+                self.quad_read(x, src, [0, 1, 2, 3].map(|q| ctrl >> (2 * q) & 3))
+            }
+            _ => self.read_lane(x, src),
         };
         let mut enable = None;
         if let Some(inside) = inside {
@@ -7279,7 +7666,9 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            // (in the paired form rows 2 and 3 are the upper lanes')
+            let row_lane = if self.twin.is_some() { self.console_lane() } else { lane };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -8089,6 +8478,14 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
+                // (the paired form: a wave64 lane select takes the low six bits)
+                let lane = match self.twin {
+                    Some(_) => {
+                        let k63 = self.s.m.i32(63);
+                        self.s.m.bin(c, Bin::And, lane, k63)
+                    }
+                    None => lane,
+                };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -8159,7 +8556,7 @@ impl<'a> Lower<'a> {
                         self.s.m.select(c, in_lo, lo, hi)
                     }
                 } else {
-                    mine
+                    self.helper_reads_own(a, mine)
                 };
                 int(self, r)
             }
@@ -8768,7 +9165,8 @@ impl<'a> Lower<'a> {
             let t = self.binary(35, a, lo);
             let t = self.binary(36, t, hi);
             let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-            let nan = self.s.m.cmp(c, pred::UNO, a, a);
+            // on the bits: `fcmp uno` may be folded under fast-math (`is_nan_f32`)
+            let nan = self.is_nan_f32(a);
             let z = self.s.m.i32(0);
             let r = self.s.m.select(c, nan, z, r);
             return self.write_half(inst, r, guard);
@@ -9493,34 +9891,68 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                if op == "lg" {
-                    // Ordered and not equal, false for a NaN, as `olt | ogt`.
-                    // `fcmp one` means the same, but the AMD D3D12 driver
-                    // runs it as unordered (true for a NaN) where NVIDIA
-                    // and WARP do not; olt and ogt agree on all three.
-                    let lt = self.s.m.cmp(c, pred::OLT, a, b);
-                    let gt = self.s.m.cmp(c, pred::OGT, a, b);
-                    self.s.m.bin(c, Bin::Or, lt, gt)
-                } else {
+                // Every comparison that a NaN makes true (`u` and the `n`
+                // forms), and `o`, test NaN on the bits (`is_nan_f32`) and
+                // compare ordered otherwise: with the fast-math flag
+                // (`bitcode::opt::FAST`) on the float operations that made
+                // `a` and `b`, a driver may take them as never NaN and fold
+                // `fcmp uno` to false, `fcmp ord` to true and an unordered
+                // predicate to its ordered one (LLVM's `isKnownNeverNaN`),
+                // which loses the title's own NaN tests (v_cmp_u_f32 and
+                // friends, as `isnan` compiles), and a NaN it meant to scrub
+                // runs on into the frame. Ordered predicates mean the same
+                // either way.
+                // (shortcut: `a` and `b` read as f32; f16 sources are
+                // widened by `half_fsrc`, which keeps a NaN a NaN.)
+                let ordered = |l: &mut Self, op: &str| -> Option<V> {
                     let p = match op {
-                        "f" => pred::FALSE,
                         "lt" => pred::OLT,
                         "eq" => pred::OEQ,
                         "le" => pred::OLE,
                         "gt" => pred::OGT,
                         "ge" => pred::OGE,
-                        "o" => pred::ORD,
-                        "u" => pred::UNO,
-                        "nge" => pred::ULT,
-                        "nlg" => pred::UEQ,
-                        "ngt" => pred::ULE,
-                        "nle" => pred::UGT,
-                        "neq" => pred::UNE,
-                        "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
+                        "lg" => {
+                            // Ordered and not equal, false for a NaN, as `olt | ogt`.
+                            // `fcmp one` means the same, but the AMD D3D12 driver
+                            // runs it as unordered (true for a NaN) where NVIDIA
+                            // and WARP do not; olt and ogt agree on all three.
+                            let lt = l.s.m.cmp(c, pred::OLT, a, b);
+                            let gt = l.s.m.cmp(c, pred::OGT, a, b);
+                            return Some(l.s.m.bin(c, Bin::Or, lt, gt));
+                        }
+                        _ => return None,
+                    };
+                    Some(l.s.m.cmp(c, p, a, b))
+                };
+                if let Some(r) = ordered(self, op) {
+                    r
+                } else if op == "f" || op == "tru" {
+                    self.s.m.bool(op == "tru")
+                } else {
+                    let (na, nb) = (self.is_nan_f32(a), self.is_nan_f32(b));
+                    let nan = self.s.m.bin(c, Bin::Or, na, nb);
+                    // "not (a op b)": true for a NaN, else the opposite ordered test
+                    let opposite = match op {
+                        "o" | "u" => None,
+                        "nge" => Some("lt"),
+                        "nlg" => Some("eq"),
+                        "ngt" => Some("le"),
+                        "nle" => Some("gt"),
+                        "neq" => Some("lg"),
+                        "nlt" => Some("ge"),
                         _ => return Err(inst.name()),
                     };
-                    self.s.m.cmp(c, p, a, b)
+                    match opposite {
+                        None if op == "u" => nan,
+                        None => {
+                            let yes = self.s.m.bool(true);
+                            self.s.m.bin(c, Bin::Xor, nan, yes)
+                        }
+                        Some(o) => {
+                            let r = ordered(self, o).expect("an ordered comparison");
+                            self.s.m.bin(c, Bin::Or, r, nan)
+                        }
+                    }
                 }
             }
             "u64" | "i64" => {
@@ -11640,6 +12072,16 @@ impl<'a> Lower<'a> {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
+                    // (the paired form: a branch the wave does not take together must be one
+                    // that both lanes of every thread take the same way)
+                    _ if self.twin.is_some()
+                        && !self.x.st.bools.support(when).iter().all(
+                            |a| matches!(a, Atom::Uniform(v) if !self.lane_scalars.contains(v)),
+                        ) =>
+                    {
+                        const APART: Why = "a branch the two lanes of a thread may not take together";
+                        return Err(unsupported(offset, APART));
+                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
@@ -11812,7 +12254,7 @@ impl<'a> Lower<'a> {
         // half of an interpolation", foliage mesh shaders); until those are
         // lowered they keep drawing with that zero.
         static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
+        let strict = self.twin.is_some() || *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
         let mut work: Vec<Value> = if strict {
             self.read_phis.iter().copied().collect()
         } else {
@@ -11942,631 +12384,5 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
-    use crate::native::{
-        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
-    };
-    use crate::{io, ir, resource, structure};
-
-    const S_ENDPGM: u32 = 0xBF81_0000;
-
-    #[test]
-    fn packed_pixel_inputs_find_their_second_row() {
-        use super::super::container::SigElement;
-        use super::half_input_partners;
-        use crate::native::{PsInput, Usage};
-        let entry = |row, row2, pack2| PsInput {
-            usage: Usage::Generic,
-            row,
-            mask: 0xF,
-            attr: row,
-            flat: false,
-            fp16: true,
-            pack2,
-            row2,
-        };
-        let element = |row| SigElement {
-            name: "TEXCOORD".into(),
-            index: row,
-            kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(row),
-            col: 0,
-            cols: 4,
-            usage: 0,
-            half: true,
-        };
-        // Rows 0 and 3 pack and leave their second row out; 5 names its
-        // own (6). Unnamed 16-bit rows: 1, 4, 6, 7.
-        let io = StageIo::Ps {
-            inputs: vec![entry(0, 0, true), entry(3, 3, true), entry(5, 6, true)],
-            input_addr: 0,
-            db_shader_control: 0,
-            patches: vec![],
-        };
-        let sig: Vec<_> = [0, 1, 3, 4, 5, 6, 7].map(element).into();
-        let p = half_input_partners(&io, &sig);
-        assert_eq!(p.get(&0), Some(&1));
-        assert_eq!(p.get(&3), Some(&4));
-        assert_eq!(p.get(&5), None);
-    }
-
-    /// The packed pedestrian layouts of the title: an element
-    /// behind another one in its register follows in the first parameter
-    /// with a dword left, and is not a half of its register's row.
-    #[test]
-    fn packed_elements_behind_another_take_the_first_free_dword() {
-        use super::super::container::SigElement;
-        use super::packed_half;
-        let element = |index, row, col, cols| SigElement {
-            name: "TEXCOORD".into(),
-            index,
-            kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(row),
-            col,
-            cols,
-            usage: 0,
-            half: true,
-        };
-        // MS_VS_PedTransformPreSkinD_Packed 005fe88ec1bdc0c7 and its pixel
-        // shader 93667197d3d05e1c: TEXCOORD6 is one value at register 4
-        // column 3; parameter 3 (rows 6 and 7) carries it in dword 3.
-        let sig = vec![
-            element(1, 2, 0, 4),
-            element(2, 3, 0, 4),
-            element(4, 4, 0, 3),
-            element(6, 4, 3, 1),
-            element(3, 5, 0, 4),
-            element(5, 6, 0, 4),
-            element(7, 7, 0, 2),
-            element(9, 9, 0, 3),
-            element(11, 10, 0, 3),
-            element(15, 12, 0, 4),
-        ];
-        let packs = [
-            (2, Some(3)),
-            (4, Some(5)),
-            (6, Some(7)),
-            (9, Some(10)),
-            (12, None),
-        ];
-        let at = |a, h| packed_half(&sig, &packs, a, h);
-        // Parameter 2: TEXCOORD4's three values, a zero half, TEXCOORD3.
-        assert_eq!(at(4, 2), Some((4, 2)));
-        assert_eq!(at(4, 3), None);
-        assert_eq!(at(4, 4), Some((5, 0)));
-        assert_eq!(at(4, 7), Some((5, 3)));
-        // Parameter 3: TEXCOORD5, TEXCOORD7, then TEXCOORD6 alone.
-        assert_eq!(at(6, 3), Some((6, 3)));
-        assert_eq!(at(6, 5), Some((7, 1)));
-        assert_eq!(at(6, 6), Some((4, 3)));
-        assert_eq!(at(6, 7), None);
-        // Parameters without such an element are as before.
-        assert_eq!(at(9, 3), None);
-        assert_eq!(at(9, 4), Some((10, 0)));
-        assert_eq!(at(12, 3), Some((12, 3)));
-        assert_eq!(at(12, 4), None);
-        // The common layout (29805d23a495cdf8): TEXCOORD7 is two values at
-        // register 1 columns 2-3; parameter 0 is TEXCOORD0, TEXCOORD1,
-        // TEXCOORD7.
-        let sig = vec![
-            element(0, 1, 0, 2),
-            element(7, 1, 2, 2),
-            element(1, 2, 0, 4),
-            element(2, 3, 0, 4),
-            element(4, 4, 0, 3),
-        ];
-        let packs = [(3, Some(4)), (1, Some(2))];
-        let at = |a, h| packed_half(&sig, &packs, a, h);
-        assert_eq!(at(1, 1), Some((1, 1)));
-        assert_eq!(at(1, 2), Some((2, 0)));
-        assert_eq!(at(1, 5), Some((2, 3)));
-        assert_eq!(at(1, 6), Some((1, 2)));
-        assert_eq!(at(1, 7), Some((1, 3)));
-        assert_eq!(at(3, 6), Some((4, 2)));
-        assert_eq!(at(3, 7), None);
-        // A row no element holds gives nothing, as before.
-        assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
-    }
-
-    /// Whether a synthetic compute program translates with these input registers.
-    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, false, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-        .map(|_| ())
-    }
-
-    /// Lowers a compute program with the root parameters `layout` (in user
-    /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
-        words: &[u32],
-        layout: Vec<RootParam>,
-        used: Vec<UsedResource>,
-    ) -> Result<Lowered, crate::ShaderError> {
-        lower_wave(words, layout, used, false)
-    }
-
-    /// [`lower_with`] in wave64 if `wave64`.
-    fn lower_wave(
-        words: &[u32],
-        layout: Vec<RootParam>,
-        used: Vec<UsedResource>,
-        wave64: bool,
-    ) -> Result<Lowered, crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64,
-            vgprs: 256,
-            layout,
-            used,
-            io: StageIo::Cs(ComputeIo {
-                // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, wave64, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-    }
-
-    /// Root parameter `slot` in user SGPRs from `user_data` on.
-    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
-        RootParam {
-            root,
-            table_offset_dwords: 0,
-            sgprs: if root == RootType::Descriptor { 2 } else { 1 },
-            base_register: 0,
-            user_data,
-            slot,
-        }
-    }
-
-    #[test]
-    fn buffer_cache_invalidations_lower_as_no_ops() {
-        // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
-        // host to invalidate its cached view of a buffer.
-        assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
-        assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
-    }
-
-    #[test]
-    fn a_scalar_carry_chain_reaches_the_select() {
-        // The high dword of a 64-bit add or subtract, then a select on the
-        // carry (borrow) the high half leaves in SCC, and a branch on it
-        // (only code with an effect needs its operands).
-        let add = [
-            0xBE80_03C1, // s_mov_b32 s0, -1
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0x8000_8100, // s_add_u32 s0, s0, 1
-            0x8201_8001, // s_addc_u32 s1, s1, 0
-            0x8502_0001, // s_cselect_b32 s2, s1, s0
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-        let sub = [
-            0xBE80_0380, // s_mov_b32 s0, 0
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0x8080_8100, // s_sub_u32 s0, s0, 1
-            0x8281_8001, // s_subb_u32 s1, s1, 0
-            0x8502_0001, // s_cselect_b32 s2, s1, s0
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-
-        for words in [add, sub] {
-            lowers(&words, 0).unwrap();
-        }
-    }
-
-    fn perm_features(selector: u32) -> u64 {
-        // Synthetic compute shader:
-        // v0 is the thread ID and can supply a dynamic selector.
-        // Store the result in LDS to keep the permutation live.
-        let words = [
-            0x7E02_02FFu32,
-            0x817F_34AB,
-            0x7E04_02FF,
-            0xFE01_56CD,
-            0xD744_0003,
-            257 | (258 << 9) | (selector << 18),
-            0x3408_0082,
-            0xD834_0000,
-            0x0000_0304,
-            S_ENDPGM,
-        ];
-
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 1 << 15,
-                threads: [64, 1, 1],
-            }),
-            code,
-        };
-
-        let p = ir::build(&native.code, false, 256).unwrap();
-
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
-
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-
-        let io = io::raise(&p, &native).unwrap();
-
-        let emitted = lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        }).unwrap();
-
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
-
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
-
-        u64::from_le_bytes(features.data.try_into().unwrap())
-    }
-
-    #[test]
-    fn perm_constant_selector_needs_no_int64() {
-        assert_eq!(perm_features(128) & 0x8000, 0);
-    }
-
-    #[test]
-    fn perm_dynamic_selector_needs_no_int64() {
-        assert_eq!(
-            perm_features(256) & 0x8000,
-            0,
-            "dynamic v_perm_b32 must not require INT64"
-        );
-    }
-
-    #[test]
-    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
-        // Two buffer descriptors loaded from the table at s0, one picked by
-        // a root constant (s1) with s_cselect_b64 per half, and loaded
-        // through by index and stored to LDS so the load is needed.
-        let words = [
-            0xBE84_0300, // s_mov_b32 s4, s0
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xF408_0202,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
-            0xF408_0302,
-            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
-            0xBF06_8001, // s_cmp_eq_u32 s1, 0
-            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
-            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
-            0xE030_2000,
-            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
-            0xD834_0000,
-            0x0000_0100, // ds_write_b32 v0, v1
-            S_ENDPGM,
-        ];
-        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
-        // Both are structured buffers of dwords in the table's range.
-        let used = || {
-            vec![UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 4,
-                dwords: 4,
-                user_data: 0,
-                slot: 0,
-            }]
-        };
-        lower_with(&words, layout(), used()).unwrap();
-    }
-
-    /// Tables of 2D textures at s0 and samplers at s1.
-    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
-        let range = |kind, user_data, slot| UsedResource {
-            kind,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: if kind == ResourceType::Sampler { 4 } else { 8 },
-            user_data,
-            slot,
-        };
-        (
-            vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
-            vec![
-                range(ResourceType::Srv, 0, 0),
-                range(ResourceType::Sampler, 1, 1),
-            ],
-        )
-    }
-
-    #[test]
-    fn a_uniform_branch_can_choose_between_immediate_samplers() {
-        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
-        let words = [
-            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
-            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
-            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
-            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
-            0xBF85_0002,                    // branch to clamp
-            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
-            0xBE88_03FF, 0x0000_0092,       // clamp all axes
-            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
-            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
-            S_ENDPGM,
-        ];
-        let (mut layout, mut used) = texture_tables();
-        layout[1] = root(RootType::Constants, 1, 1);
-        used.truncate(1);
-        let shader = lower_with(&words, layout, used).unwrap();
-        assert_eq!(shader.samplers.len(), 2);
-        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
-        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
-    }
-
-    #[test]
-    fn waterfall_loops_over_per_lane_descriptors_sample_with_each_lanes_own() {
-        use crate::resource::tests::{
-            WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
-        };
-        for (words, wave64) in [
-            (WATERFALL_FETCHED_WAVE32, false),
-            (WATERFALL_FETCHED_WAVE64, true),
-            (WATERFALL_PICKED_WAVE32, false),
-        ] {
-            let (layout, used) = texture_tables();
-            let l = lower_wave(words, layout, used, wave64).unwrap();
-            // The loop's reads of the first lane became each lane's own
-            // dwords: no wave operation is left.
-            assert_eq!(l.nonuniform_handles, 1);
-            assert!(!l.wave_ops);
-        }
-    }
-
-    /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
-    pub(crate) fn texture_and_uav_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
-        let (layout, mut used) = texture_tables();
-        used.push(UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 16,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 0,
-            slot: 0,
-        });
-        (layout, used)
-    }
-
-    #[test]
-    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
-        use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
-        for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
-            let (layout, used) = texture_and_uav_tables();
-            let l = lower_wave(words, layout, used, false).unwrap();
-            // One image handle, from the join's per-lane heap index.
-            assert_eq!(l.nonuniform_handles, 1);
-            assert!(!l.wave_ops);
-        }
-    }
-
-    #[test]
-    fn scalar_bit_tests_lower() {
-        // Each tests one bit of a constant into SCC and branches on it (only
-        // code with an effect needs its operands).
-        let tail = [
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE84_0380, // s_mov_b32 s4, 0
-            S_ENDPGM,
-        ];
-        let bit_tests: [&[u32]; 4] = [
-            &[0xBE81_0387, 0xBF0C_8301], // s_mov_b32 s1, 7; s_bitcmp0_b32 s1, 3
-            &[0xBE81_0387, 0xBF0D_8301], // s_mov_b32 s1, 7; s_bitcmp1_b32 s1, 3
-            &[
-                0xBE80_0387, // s_mov_b32 s0, 7
-                0xBE81_0380, // s_mov_b32 s1, 0
-                0xBF0E_8300, // s_bitcmp0_b64 s[0:1], 3
-            ],
-            &[
-                0xBE80_0387, // s_mov_b32 s0, 7
-                0xBE81_0380, // s_mov_b32 s1, 0
-                0xBF0F_8300, // s_bitcmp1_b64 s[0:1], 3
-            ],
-        ];
-        for head in bit_tests {
-            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words, 0).unwrap();
-        }
-    }
-
-    #[test]
-    #[ignore = "ours marks joins read through joins only with VICTORY_STRICT_JOINS (40 programs stop otherwise)"]
-    fn a_missing_value_stays_missing_through_two_live_joins() {
-        let mut words = [
-            0xF490_0180,
-            0,           // s_memtime s[6:7]
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
-            0xBF85_0001, // skip the first overwrite
-            0xBE86_0380, // s_mov_b32 s6, 0
-            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
-            0xBF85_0001, // skip the second overwrite
-            0xBE86_0381, // s_mov_b32 s6, 1
-            0xBF07_8006, // s_cmp_lg_u32 s6, 0
-            0xBF85_0001, // use the result to branch
-            0xBE83_0380,
-            S_ENDPGM,
-        ];
-        let group_ids_xy = 3 << 7;
-        // Compare to a direct read so future timestamp support works in both cases.
-        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
-            Ok(()) => None,
-            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
-            Err(error) => panic!("{error}"),
-        };
-        let direct = [&words[..2], &words[8..]].concat();
-        assert_eq!(refusal(&words), refusal(&direct));
-        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
-        lowers(&words, group_ids_xy).expect("dead timestamp");
-    }
-
-    #[test]
-    fn buffer_formats_by_number() {
-        // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
-        // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
-        assert_eq!(buffer_format(56), Some((&[8, 8, 8, 8][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(24), Some((&[16, 16][..], Numeric::Snorm)));
-        assert_eq!(
-            buffer_format(50),
-            Some((&[10, 10, 10, 2][..], Numeric::Unorm))
-        );
-        assert_eq!(buffer_format(13), Some((&[16][..], Numeric::Float)));
-        assert_eq!(
-            buffer_format(77),
-            Some((&[32, 32, 32, 32][..], Numeric::Float))
-        );
-        // Invalid, past the table.
-        assert_eq!(buffer_format(0), None);
-        assert_eq!(buffer_format(78), None);
-    }
-
-    #[test]
-    fn packed_buffer_formats_by_number() {
-        // LLVM's `UfmtGFX10`: 10_11_11 is 30-36, 11_11_10 37-43,
-        // 10_10_10_2 44-49. Channels from the lowest bits: R11G11B10_FLOAT
-        // is 10_11_11 (Mesa), 10_10_10_2 has the 2-bit channel first.
-        assert_eq!(buffer_format(30), Some((&[11, 11, 10][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(36), Some((&[11, 11, 10][..], Numeric::Float)));
-        assert_eq!(buffer_format(37), Some((&[10, 11, 11][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(43), Some((&[10, 11, 11][..], Numeric::Float)));
-        assert_eq!(
-            buffer_format(44),
-            Some((&[2, 10, 10, 10][..], Numeric::Unorm))
-        );
-        assert_eq!(
-            buffer_format(45),
-            Some((&[2, 10, 10, 10][..], Numeric::Snorm))
-        );
-        assert_eq!(
-            buffer_format(46),
-            Some((&[2, 10, 10, 10][..], Numeric::Uscaled))
-        );
-        assert_eq!(
-            buffer_format(47),
-            Some((&[2, 10, 10, 10][..], Numeric::Sscaled))
-        );
-        assert_eq!(
-            buffer_format(48),
-            Some((&[2, 10, 10, 10][..], Numeric::Uint))
-        );
-        assert_eq!(
-            buffer_format(49),
-            Some((&[2, 10, 10, 10][..], Numeric::Sint))
-        );
-    }
-
-    /// A half's value (sign, 5-bit exponent biased 15, 10-bit mantissa), as
-    /// `legacyF16ToF32` widens it.
-    fn half(h: u32) -> f32 {
-        let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
-        let v = match e {
-            0 => m as f32 * 2f32.powi(-24),
-            31 if m == 0 => f32::INFINITY,
-            31 => f32::NAN,
-            _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
-        };
-        if s == 1 { -v } else { v }
-    }
-
-    #[test]
-    fn small_floats_widen_as_halves() {
-        // Unsigned 11- and 10-bit floats: a 5-bit exponent biased 15 over a
-        // 6- or 5-bit mantissa, no sign; values from the D3D/GL spec.
-        let f11 = |x: u32| half(x << half_shift(11));
-        let f10 = |x: u32| half(x << half_shift(10));
-        assert_eq!(f11(0), 0.0);
-        assert_eq!(f11(0x001), 2f32.powi(-20)); // smallest denormal
-        assert_eq!(f11(0x03F), 63.0 * 2f32.powi(-20)); // largest denormal
-        assert_eq!(f11(0x040), 2f32.powi(-14)); // smallest normal
-        assert_eq!(f11(0x3C0), 1.0);
-        assert_eq!(f11(0x3E0), 1.5);
-        assert_eq!(f11(0x7BF), 65024.0); // largest
-        assert_eq!(f11(0x7C0), f32::INFINITY);
-        assert!(f11(0x7C1).is_nan());
-        assert_eq!(f10(0x001), 2f32.powi(-19));
-        assert_eq!(f10(0x020), 2f32.powi(-14));
-        assert_eq!(f10(0x1E0), 1.0);
-        assert_eq!(f10(0x3DF), 64512.0);
-        assert_eq!(f10(0x3E0), f32::INFINITY);
-        assert!(f10(0x3FF).is_nan());
-        // A 16-bit float is a half already, sign included.
-        assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    }
-}
+#[path = "lower_tests.rs"]
+mod tests;

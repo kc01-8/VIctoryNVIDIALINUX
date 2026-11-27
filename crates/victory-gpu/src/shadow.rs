@@ -440,7 +440,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1280) << 20
     })
 }
 
@@ -468,7 +468,8 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// memory as before.
 fn window_upload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_some_and(|v| v == "1"))
+    // On unless `VICTORY_WINDOW_UPLOAD=0`.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_none_or(|v| v != "0"))
 }
 
 /// A window's buffer in a GPU upload heap and where it is mapped, if
@@ -1491,6 +1492,21 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
+    if kept_threads_now() {
+        let jobs: Vec<Job> = (0..threads)
+            .map(|i| {
+                let at = (i * each).min(len);
+                let n = each.min(len - at);
+                Box::new(move || {
+                    // SAFETY: a part of the caller's ranges; `wide` returns
+                    // only when every part is copied.
+                    unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                }) as Job
+            })
+            .collect();
+        wide(jobs);
+        return;
+    }
     std::thread::scope(|s| {
         for i in 0..threads {
             let at = (i * each).min(len);
@@ -1534,7 +1550,7 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
-struct Workers {
+pub(crate) struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
 }
@@ -1542,15 +1558,25 @@ struct Workers {
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
-    let workers = WORKERS.get_or_init(|| Workers {
+    let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+    kept_pool(&WORKERS, &STARTED, "victory-wide", n)
+}
+
+/// The kept threads of a pool: `n` threads named `name-i`, started once.
+fn kept_pool(
+    cell: &'static std::sync::OnceLock<Workers>,
+    started: &'static std::sync::Once,
+    name: &'static str,
+    n: usize,
+) -> &'static Workers {
+    let workers = cell.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
     });
-    STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+    started.call_once(|| {
         for i in 0..n {
-            let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
-                let workers = WORKERS.get().expect("made above");
+            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                let workers = cell.get().expect("made above");
                 loop {
                     let job = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1569,16 +1595,31 @@ fn workers() -> &'static Workers {
     workers
 }
 
+/// The kept threads that bring textures up to date ahead of their
+/// submission (`HostList::refresh_textures_ahead`, on the heap worker's
+/// thread): three and the caller, a pool of their own, so that the
+/// submitting thread never runs a texture's work (and its locks) inside its
+/// own [`wide`], nor waits behind it.
+pub(crate) fn ahead_workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    kept_pool(&WORKERS, &STARTED, "victory-ahead", 3)
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
+    wide_in(workers(), jobs);
+}
+
+/// [`wide`] on the pool `workers`.
+fn wide_in(workers: &'static Workers, jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
         }
         return;
     }
-    let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1612,6 +1653,65 @@ fn wide(jobs: Vec<Job>) {
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// Whether short-lived parallel work (texture refreshes ahead, big copies and
+/// compares) runs on the kept threads of [`wide`] instead of threads spawned
+/// for each call (`VICTORY_KEPT_THREADS`: 1 the default, 0 spawned as before,
+/// `alt` twenty seconds each in turn, each change said in the log). A spawned
+/// thread costs its creation, the title's thread-attach callbacks, and a
+/// fresh thread-local read buffer grown (zero-filled) to the largest texture
+/// it reads, freed again when it ends: some 5 flushes a frame of 4 threads.
+pub(crate) fn kept_threads_now() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_KEPT_THREADS").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "parallel host work from now (VICTORY_KEPT_THREADS=alt): {}",
+                    if on { "ON, on the kept threads" } else { "off, threads spawned per call" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`wide`] for jobs that borrow from the caller: returns only when every
+/// job has run, and a panic in one is caught where it ran and raised again
+/// here after all of them are done (so no borrow outlives this call).
+pub(crate) fn wide_scoped<'a>(workers: &'static Workers, jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    let panicked: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> = Arc::new(Mutex::new(None));
+    let jobs: Vec<Job> = jobs
+        .into_iter()
+        .map(|job| {
+            let panicked = panicked.clone();
+            let job: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+                    *panicked.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                }
+            });
+            // SAFETY: `wide` returns only after every job it was given has
+            // run to its end (a job cannot unwind past the catch above), so
+            // nothing the job borrows for `'a` is used after this call.
+            unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job) }
+        })
+        .collect();
+    wide_in(workers, jobs);
+    let caught = panicked.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(e) = caught {
+        std::panic::resume_unwind(e);
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -1806,6 +1906,49 @@ mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Borrowed jobs all run before `wide_scoped` returns, on either pool,
+    /// and a panic in one comes back to the caller only after the others ran.
+    #[test]
+    fn scoped_jobs_borrow_and_panics_come_back() {
+        use super::{ahead_workers, wide_scoped, workers};
+        for pool in [workers(), ahead_workers()] {
+            let mut slots = vec![0u64; 37];
+            {
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> =
+                    slots.iter_mut().enumerate().map(|(i, s)| Box::new(move || *s = i as u64 * 3) as Box<dyn FnOnce() + Send + '_>).collect();
+                wide_scoped(pool, jobs);
+            }
+            assert!(slots.iter().enumerate().all(|(i, &s)| s == i as u64 * 3));
+            let ran = AtomicUsize::new(0);
+            let ran_ref = &ran;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = (0..9)
+                    .map(|i| {
+                        Box::new(move || {
+                            if i == 4 {
+                                panic!("job 4");
+                            }
+                            ran_ref.fetch_add(1, Ordering::SeqCst);
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                wide_scoped(pool, jobs);
+            }));
+            assert!(caught.is_err());
+            assert_eq!(ran.load(Ordering::SeqCst), 8);
+        }
+    }
+
+    /// The kept-thread copy and compare give what the spawned ones gave.
+    #[test]
+    fn kept_copy_is_whole() {
+        let src: Vec<u8> = (0..(40usize << 20)).map(|i| (i * 31 + 7) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        // SAFETY: two separate allocations of the same length.
+        unsafe { super::copy_wide(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
+        assert!(src == dst);
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -3300,6 +3443,20 @@ impl Shadow {
             (at - (start + at) % PIECE).max(from)
         };
         let scan = &scan;
+        if kept_threads_now() {
+            let parts: Vec<Mutex<Vec<(usize, usize)>>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
+            let parts_ref = &parts;
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = (0..threads)
+                .map(|i| {
+                    let (a, b) = (cut(i), cut(i + 1));
+                    Box::new(move || {
+                        *parts_ref[i].lock().unwrap_or_else(|e| e.into_inner()) = scan(a, b);
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            wide_scoped(workers(), jobs);
+            return parts.into_iter().flat_map(|p| p.into_inner().unwrap_or_else(|e| e.into_inner())).collect();
+        }
         std::thread::scope(|s| {
             let parts: Vec<_> = (0..threads)
                 .map(|i| {
@@ -4610,6 +4767,8 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off unless `VICTORY_WINDOW_TAILS=1` (with a 512 KiB grid, run 354: the
+    // preparing thread's lists' steps 44-68 ms against 31-33).
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
 }
 

@@ -90,8 +90,9 @@ fn small_when_full_mb() -> u64 {
         std::env::var("VICTORY_TILES_SMALL_WHEN_FULL_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            // 512 unless set: without it run 341 showed 612 black textures.
-            .map_or(512, |mb| mb.min(1024))
+            // 256 unless set (the run set gives 512): without it run 341
+            // showed 612 black textures.
+            .map_or(256, |mb| mb.min(1024))
     })
 }
 

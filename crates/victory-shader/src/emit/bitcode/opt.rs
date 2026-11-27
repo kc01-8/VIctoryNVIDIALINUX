@@ -64,17 +64,18 @@ pub const WIDE: u32 = 64;
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// The passes that run when nothing says which: every one, [`WIDE`] (with
+/// the dead-dword masks of `narrow_raw_loads` and the view-end guard) too,
+/// but not [`FAST`] (runs 354/355: black blotches on skin and clothes with
+/// it, run 356 none without); `VICTORY_SHADER_OPT=63` drops the wide loads.
+pub const DEFAULT: u32 = ALL;
 /// Not a pass either: the 32-bit float binary operations are written with
 /// LLVM's unsafe-algebra fast-math flag, as an HLSL compiler writes them by
 /// default, so the driver may fuse a multiply and an add and turn a division
 /// by a constant into a multiply. Results may differ in the last bits and
-/// NaN/infinity checks may be folded away, so it is off unless asked:
-/// `VICTORY_SHADER_OPT=255` is every pass with it, 191 every pass but
-/// [`WIDE`] with it. Outside [`ALL`], so `127` stays "every pass".
+/// NaN/infinity checks may be folded away. In [`DEFAULT`]; `VICTORY_SHADER_OPT=63` is the passes
+/// without it, 255 every pass with it. Outside [`ALL`], so `127` stays
+/// "every pass" without it.
 pub const FAST: u32 = 128;
 
 /// What the instructions a module writes use, of the features a shader

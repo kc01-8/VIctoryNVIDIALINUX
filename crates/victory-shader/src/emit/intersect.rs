@@ -43,7 +43,7 @@ thread_local! {
 }
 
 /// Whether a node test answers "no hit" and reads nothing
-/// (`VICTORY_BVH_NO_HIT=1`; off by default; never with
+/// (on by default, `VICTORY_BVH_NO_HIT=0` turns it off; never with
 /// `VICTORY_BVH_BUILDER=1`, which has the structures built).
 ///
 /// The title's structure builder does not run in the layer unless asked
@@ -58,11 +58,13 @@ thread_local! {
 /// word at run time; here it is a translation, since the builder's state
 /// does not change during a run of ours.)
 fn no_hit() -> bool {
-    #[cfg(test)]
-    if TEST_NO_HIT.get() {
-        return true;
+    // Tests ask for it themselves; the default below is for runs.
+    if cfg!(test) {
+        #[cfg(test)]
+        return TEST_NO_HIT.get();
     }
-    std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
+    // On unless `VICTORY_BVH_NO_HIT=0` or the builder runs (`VICTORY_BVH_BUILDER=1`).
+    std::env::var_os("VICTORY_BVH_NO_HIT").is_none_or(|v| v != "0")
         && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
 }
 

@@ -12,6 +12,26 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload every translated mesh shader declares and never
+/// reads: 4 with `VICTORY_MESH_LAUNCH=1` (or `alt`), none otherwise (as before). With
+/// it the host puts an amplification shader of its own in front of the
+/// mesh shader (the launch of an indirect mesh record, `victory-gpu`'s
+/// `launch`), whose payload must have the size the mesh shader declares: a
+/// mesh shader that declares none is refused with one (the RTX 5080's
+/// driver returns `E_INVALIDARG`), and one that declares a payload is still
+/// taken without an amplification shader. Read here too so that the switch
+/// is part of the shader cache's key.
+pub fn mesh_payload_bytes() -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1" || v == "alt")) {
+        4
+    } else {
+        0
+    }
+}
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -176,6 +196,12 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Wide raw loads given a bounds check (`lower.rs`, `raw_dwords`).
+    #[cfg(test)]
+    pub guarded_wide_loads: u32,
+    /// Quad-local reads written through quad operations (`lower.rs`, `quad_read`).
+    #[cfg(test)]
+    pub quad_reads: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -232,6 +258,10 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            guarded_wide_loads: 0,
+            #[cfg(test)]
+            quad_reads: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -738,7 +768,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

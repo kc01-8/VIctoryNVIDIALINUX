@@ -48,7 +48,8 @@ fn heap_locks() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_LOCKS").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -2443,6 +2444,15 @@ impl HostHeap {
         // Made from this record already ([`heap_locks`]): what the lock
         // would find, without it. (The view is looked up first, as under
         // the lock: a record whose view is gone is not served here.)
+        if !for_draw
+            && tag != VIEW_TAG
+            && heap_locks()
+            && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == 0
+        {
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_NOT_VIEW);
+            return None;
+        }
         if tag == VIEW_TAG
             && heap_locks()
             && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key

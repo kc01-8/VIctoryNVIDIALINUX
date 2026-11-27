@@ -79,6 +79,10 @@ fn build() -> [u8; 32] {
     if let Some(value) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
         h.update(value.as_encoded_bytes());
     }
+    h.update(b"\0VICTORY_WAVE_PAIRS_ONLY=");
+    if let Some(value) = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY") {
+        h.update(value.as_encoded_bytes());
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -105,7 +109,64 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     });
     let hash = blake3::hash(c).to_hex();
     let wide = list.iter().any(|h| hash.starts_with(h.as_str()));
-    victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+    static PAIRS: OnceLock<Vec<String>> = OnceLock::new();
+    let pairs = PAIRS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRS_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    let paired = listed_pair_hash(hash.as_str(), pairs);
+    if paired {
+        eprintln!("WAVE64-PAIRS-ONLY selected {}", &hash.as_str()[..16]);
+    }
+    victory_shader::emit::with_wave_wide(wide, || {
+        victory_shader::emit::with_wave_pairs(paired, || victory_shader::emit::translate(c))
+    }).map_err(|e| e.to_string())
+}
+
+fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
+    hash.get(..16).is_some_and(|prefix| list.iter().any(|h| h == prefix))
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_hash_matches_only_complete_log_hashes() {
+    let list = vec!["5dc3b25986622949".to_owned(), "6f225b641c5b0708".to_owned()];
+    assert!(listed_pair_hash("5dc3b25986622949ffffffffffffffffffffffffffffffff", &list));
+    assert!(listed_pair_hash("6f225b641c5b0708", &list));
+    assert!(!listed_pair_hash("5dc3b25986622940", &list));
+    assert!(!listed_pair_hash("5dc3", &list));
+    assert!(!listed_pair_hash("5dc3b25986622949", &["5dc3".to_owned()]));
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_cache_key_changes() {
+    const CHILD: &str = "VICTORY_CACHE_PAIRS_KEY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        println!("pairs-cache-key={}", blake3::Hash::from_bytes(build()));
+        return;
+    }
+    let key = |list: &str| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["listed_pair_cache_key_changes", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("VICTORY_WAVE_PAIRS", "0")
+            .env("VICTORY_WAVE_PAIRS_ONLY", list)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().lines()
+            .find_map(|line| line.split_once("pairs-cache-key=").map(|(_, key)| key.to_owned()))
+            .expect("the child printed its cache key")
+    };
+    let off = key("");
+    assert_ne!(off, key("5dc3b25986622949"));
+    assert_ne!(key("5dc3b25986622949"), key("6f225b641c5b0708"));
+    assert_eq!(off, key(""));
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is

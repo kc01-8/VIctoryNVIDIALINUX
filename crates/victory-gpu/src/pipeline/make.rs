@@ -186,8 +186,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        if p.graphics.is_none() && compute_waits() {
-            // Made here, or waited for while a worker makes it.
+        // A compute pipeline in the first 600 frames (the title's one-shot
+        // world and lighting set-up passes) or with `compute_waits`: made
+        // here, or waited for while a worker makes it, instead of dropping
+        // its dispatch after the frame's budget. `make` keeps its panic guard.
+        if p.graphics.is_none() && (compute_waits() || crate::frame::current() < 600) {
             p.make();
         } else {
             wait(p, crate::frame::current());
@@ -443,7 +446,8 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 8; 6 drained a cold
+/// library 35 % slower in run 353 on a 32 GB PC) on first use, at normal priority.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
@@ -453,12 +457,6 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
                     loop {
                         next().make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {

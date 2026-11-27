@@ -1739,6 +1739,20 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if start >= end {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if first + 1 == last {
+        if g.protected.remove(&first) {
+            g.clean.remove(&first);
+            PUBLISHED.clear(first);
+            let mut old = 0;
+            unsafe { VirtualProtect((first * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            return true;
+        }
+        return false;
+    }
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))

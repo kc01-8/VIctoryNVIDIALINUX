@@ -830,6 +830,9 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        // Where shaders wrote the source (`VICTORY_CARD_FILLS`): on the card,
+        // in order (`crate::host::HostList::card_copy`).
+        && !list.card_copy(to as usize, from as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }

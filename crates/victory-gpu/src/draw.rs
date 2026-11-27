@@ -230,8 +230,9 @@ fn bake_sources_mode() -> (BakeMode, u64) {
         let mode = match std::env::var("VICTORY_BAKE_SOURCES").ok().as_deref().map(str::trim) {
             Some("count") => BakeMode::Count,
             Some("1") => BakeMode::Upload,
-            Some("full") => BakeMode::Full,
-            _ => BakeMode::Off,
+            Some("0") => BakeMode::Off,
+            // Full unless set otherwise.
+            _ => BakeMode::Full,
         };
         let mb = std::env::var("VICTORY_BAKE_SOURCES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64);
         if mode != BakeMode::Off {
@@ -1114,6 +1115,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // Where shaders wrote (`VICTORY_CARD_FILLS`): copied on the card, in order.
+    if crate::host::shaders_wrote(address as usize, len as usize)
+        && let Some(gpu) = list.card_fill(&shadow, address, len)
+    {
+        shadow.refresh(list, address, len);
+        return Some(gpu);
+    }
     if crate::host::list_reuse() {
         return list.fill_scratch(address as *const u8, len);
     }
@@ -1756,7 +1764,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack = [0u32; 64];
+                let mut heap = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    heap.resize(dwords as usize, 0);
+                    &mut heap
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -2884,7 +2899,7 @@ impl State {
             // The bake draw's own, due or not, held or not.
             Some(slots) => host.texture_slots_queued(slots),
             None => {
-                let (due, census) = host.texture_slots_due(frame, 4096);
+                let (due, census) = host.texture_slots_due(frame, 8192);
                 // What the slots shaders pick by index show, every five seconds.
                 #[cfg(feature = "diagnostics")]
                 host.placed_slot_census();
@@ -2902,7 +2917,7 @@ impl State {
         // What a run for a bake draw's own may upload.
         let sourced_at_most = bake_sources_mode().1;
         let mut sourced_bytes = 0u64;
-        // The frames in about four seconds, between 16 and 256: how long a
+        // The frames in about a second, between 8 and 64 (was four seconds, 16 to 256): how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
         // half a frame per second, while the title streams by the clock.
@@ -2915,7 +2930,7 @@ impl State {
         let took = if only { 100 } else { now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1) };
         // The worker may run two passes in a frame: no shorter than that.
         let took = if matches!(into, Into::Ahead(_)) { took.max(100) } else { took };
-        let most = (4000 / took).clamp(16, 256);
+        let most = (1000 / took).clamp(8, 64);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3682,6 +3697,7 @@ impl State {
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let launch = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.launch.as_ref());
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -3690,8 +3706,29 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    // With the launch stage the count goes to it as a root
+                    // constant (`crate::launch`).
+                    match launch {
+                        Some(launch) if crate::launch::now() => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                        }
+                        // The phase without (`VICTORY_MESH_LAUNCH=alt`): the
+                        // same pipeline without the stage.
+                        Some(launch) => {
+                            if let Some(plain) = launch.plain() {
+                                // SAFETY: an open list and a live pipeline of
+                                // the same root signature; everything set.
+                                unsafe {
+                                    list.list.SetPipelineState(plain);
+                                    l6.DispatchMesh(x, 1, 1);
+                                }
+                                self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+                                list.keep(plain);
+                            }
+                        }
+                        // SAFETY: an open list with everything set.
+                        None => unsafe { l6.DispatchMesh(x, 1, 1) },
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3833,17 +3870,30 @@ impl State {
         staged: &mut Vec<(u64, u32)>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh_mask: u64 = 0;
+        let mut fresh_extra: Vec<u8> = Vec::new();
+        let mark_fresh = |mask: &mut u64, extra: &mut Vec<u8>, slot: u8| {
+            if slot < 64 {
+                *mask |= 1u64 << slot;
+            } else if !extra.contains(&slot) {
+                extra.push(slot);
+            }
+        };
+        let is_fresh = |mask: u64, extra: &[u8], slot: u8| -> bool {
+            if slot < 64 {
+                (mask & (1u64 << slot)) != 0
+            } else {
+                extra.contains(&slot)
+            }
+        };
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            mark_fresh(&mut fresh_mask, &mut fresh_extra, u.slot);
+        }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
         let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
-            if !half.contains(&(slot, at)) {
+            if half.is_empty() || !half.contains(&(slot, at)) {
                 return None;
             }
             let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
@@ -3859,9 +3909,7 @@ impl State {
                 continue;
             };
             if crate::descriptor::host::half_view(&view).is_some() {
-                if !fresh.contains(&slot) {
-                    fresh.push(slot);
-                }
+                mark_fresh(&mut fresh_mask, &mut fresh_extra, slot);
             } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
                 once!(
                     format,
@@ -3873,7 +3921,7 @@ impl State {
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if is_fresh(fresh_mask, &fresh_extra, u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3887,26 +3935,38 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                mark_fresh(&mut fresh_mask, &mut fresh_extra, u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !is_fresh(fresh_mask, &fresh_extra, u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
+        if fresh_mask == 0 && fresh_extra.is_empty() {
+            return Vec::new();
+        }
+        fresh_extra.sort_unstable();
         let mut made = Vec::new();
-        for slot in fresh {
+        let mut entries: Vec<&UsedResource> = Vec::new();
+        let mut selected: Vec<u32> = Vec::new();
+        let mut iter_mask = fresh_mask;
+        let mut extra_idx = 0;
+        while iter_mask != 0 || extra_idx < fresh_extra.len() {
+            let slot = if iter_mask != 0 {
+                let s = iter_mask.trailing_zeros() as u8;
+                iter_mask &= iter_mask - 1;
+                s
+            } else {
+                let s = fresh_extra[extra_idx];
+                extra_idx += 1;
+                s
+            };
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            entries.clear();
+            entries.extend(used.iter().filter(tables).filter(|u| u.slot == slot));
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3916,20 +3976,22 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            selected.clear();
+            selected.extend(
+                indexed
+                    .iter()
+                    .filter(|index| index.table_slot == slot)
+                    .map(|index| {
+                        let constant = self.user_value(
+                            compute,
+                            index.constant_slot,
+                            RootType::Constants,
+                            index.constant_dword,
+                        );
+                        // The shader adds i32 byte offsets and shifts by 5.
+                        index.byte_offset.wrapping_add(constant << index.shift) / 32
+                    }),
+            );
             // The descriptors the shader moves halves through are made too,
             // and the table reaches them: they may lie past the range starts
             // the entries give (a range of several views names only its
@@ -4011,7 +4073,7 @@ impl State {
                         tally(18, 1);
                     }
                 }
-                for k in selected {
+                for &k in &selected {
                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
@@ -4055,6 +4117,16 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Where shaders wrote (`VICTORY_CARD_FILLS`): copied
+                        // on the card, in order.
+                        if crate::host::shaders_wrote(address as usize, size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && let Some(gpu) = list.card_fill(&shadow, address, u64::from(size))
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -4449,6 +4521,40 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // One mesh record of a pipeline with the launch stage: the draw
+        // reads it itself (`crate::launch`), no clamp of ours before it.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+            && crate::launch::now()
+        {
+            let offset = args.offset(arguments);
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} launched"), false));
+            // SAFETY: a live buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            list.keep(&args.buffer);
+            self.mesh_scissor(list, true);
+            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            self.mesh_scissor(list, false);
+            if !launched {
+                why("no budget for the launch");
+                return false;
+            }
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -4718,6 +4824,21 @@ impl State {
         if !ran {
             why("prepare failed");
             return false;
+        }
+        // A mesh call the launch stage does not take (a count buffer, more
+        // than one record): the same pipeline without the stage.
+        if kind == MESH
+            && let Some(launch) = &p.launch
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
