@@ -52,8 +52,6 @@ vkd3d_shader_cache/
 
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
-# The one exception (docs/asset-policy.md): the BCPack format's constant tables.
-!/crates/victory-formats/src/bcpack-tables.bin
 *.dat
 *.pak
 *.rpf
@@ -88,3 +86,6 @@ Thumbs.db
 /private.md
 /CLAUDE.local.md
 /local.env
+
+# The BCPack tables are supplied by the user, never committed (docs/asset-policy.md)
+bcpack-tables.bin

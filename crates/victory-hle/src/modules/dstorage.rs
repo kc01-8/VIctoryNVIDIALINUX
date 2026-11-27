@@ -934,10 +934,11 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
+/// The tables the user supplies (`Tables::supplied`): they are not part of
+/// this repository.
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    Tables::supplied().map_err(|e| format!("the BCPack tables: {e}"))
 }
 
 /// Tests decode streams made against tables of their own, from this folder.
