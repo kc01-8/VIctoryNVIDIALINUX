@@ -116,22 +116,23 @@ static STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static CHURN: std::sync::Mutex<BTreeMap<u64, u32>> = std::sync::Mutex::new(BTreeMap::new());
 
 /// After how many let-gos a cell's window over the pool is a copy instead
-/// of views of our own (`VICTORY_INPLACE_VIEWS_CHURN`; 2 unless set, 0:
-/// never). Under Wine every view mapped or unmapped is a request to the
+/// of views of our own (`VICTORY_INPLACE_VIEWS_CHURN`; 0, never, unless
+/// set). Under Wine every view mapped or unmapped is a request to the
 /// wineserver, one thread for the whole prefix: with every window over the
 /// pool in views (kc/foxhound run 39) it took 81 % of a core, some 2,000
 /// views mapped and as many unmapped a second, and the title's threads
 /// waited behind it; with none (run 41) 30 %, but the copies' memory, which
-/// NVIDIA's Linux driver pins, went from 0.2 to 4.4 GB. Most of the pool's
-/// cells show the same pages for long; the few the title maps anew all the
-/// time are those that churn.
+/// NVIDIA's Linux driver pins, went from 0.2 to 4.4 GB. At 2 (run 42),
+/// 800-880 cells had gone to copies by 3-5 minutes and the run reached the
+/// 18 GB cap: the churn is not in a few cells, so this is off until the
+/// cells' counts (logged with the line below) say where a limit pays.
 fn churn_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_INPLACE_VIEWS_CHURN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2)
+            .unwrap_or(0)
     })
 }
 
@@ -1833,11 +1834,18 @@ pub(crate) mod tests {
         assert!(runs(&[]).is_empty());
     }
 
-    /// A cell whose window over the pool was let go twice gets copies from
-    /// then on; one let go once, or never, gets views.
+    /// With a limit of two (`VICTORY_INPLACE_VIEWS_CHURN=2`), a cell whose
+    /// window over the pool was let go twice gets copies from then on; one
+    /// let go once, or never, gets views. Without one, none does.
     #[test]
     fn a_cell_that_churns_gets_copies() {
         let (once, twice) = (0x7f00_0040_0000u64, 0x7f00_0080_0000u64);
+        if churn_limit() != 2 {
+            views_let_go(twice);
+            views_let_go(twice);
+            assert!(churn_limit() != 0 || !churned(twice));
+            return;
+        }
         assert!(!churned(once) && !churned(twice));
         views_let_go(once);
         views_let_go(twice + 0x1_0000);
