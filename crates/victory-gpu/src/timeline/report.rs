@@ -90,6 +90,16 @@ pub(super) struct Names {
     symbols: Option<Symbols>,
 }
 
+/// Whether this runs under Wine (its ntdll has `wine_get_version`).
+fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain queries of a loaded module.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
 /// The system's symbol library (asked for when a timeline is written, not
 /// at start).
 struct Symbols {
@@ -103,6 +113,14 @@ impl Symbols {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         type Initialize = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, i32) -> i32;
         type Options = unsafe extern "system" fn(u32) -> u32;
+        // Under Wine its dbghelp falls over going through this process's
+        // modules (a read of address -1, kc/foxhound run 61, the title gone
+        // with it): addresses only, named afterwards (llvm-symbolizer), unless
+        // `VICTORY_TIMELINE_NAMES=1`.
+        if under_wine() && std::env::var_os("VICTORY_TIMELINE_NAMES").is_none_or(|v| v != "1") {
+            tracing::info!("the timeline names no functions under Wine (VICTORY_TIMELINE_NAMES=1 asks dbghelp anyway)");
+            return None;
+        }
         // SAFETY: the system's own library and functions, by their names and
         // signatures.
         unsafe {
