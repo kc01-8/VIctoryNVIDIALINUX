@@ -403,13 +403,12 @@ unsafe impl Send for Blender {}
 unsafe impl Sync for Blender {}
 
 /// Whether the panel is blended over the picture with its translucent
-/// ground (`VICTORY_PANEL_BLEND=1`); else it is copied over it, opaque.
-/// Off by default: in both runs with it (kc/foxhound runs 47 and 48) the
-/// title stopped in its own crash handler 1.5-2 minutes in, and the run
-/// without it (49) went its full 6 minutes. Not known why yet.
+/// ground (`VICTORY_PANEL_BLEND=0`: copied over it, opaque). (Runs 47 and
+/// 48 stopped early with it, but on unhandled guard faults that came of
+/// `VICTORY_FAULT_UNLOCKED`, not of this.)
 fn blend_asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PANEL_BLEND").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PANEL_BLEND").is_none_or(|v| v != "0"))
 }
 
 /// The blending pass, compiled once; `None` if it cannot be.
