@@ -165,6 +165,10 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
+                    Ok(_) => crate::feed::note(crate::feed::Kind::Translated, || format!("{} {}", self.stage, crate::feed::short(&self.hash))),
+                    Err(_) => crate::feed::note(crate::feed::Kind::Untranslated, || format!("{} {}", self.stage, crate::feed::short(&self.hash))),
+                }
+                match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -443,6 +447,7 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let frame = crate::frame::current();
+    crate::feed::note(crate::feed::Kind::Drawn, || crate::feed::shaders(&p.shaders));
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }

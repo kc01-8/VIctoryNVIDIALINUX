@@ -1,10 +1,13 @@
 //! The run's numbers on the picture, in every build (`VICTORY_PANEL=1`; off
 //! by default; F3 or the settings menu shows and hides it while our window
 //! has the focus; the time spent recording is counted in diagnostics builds
-//! only): white
-//! text on a black box in the upper left corner of what is shown, so that a
+//! only): a panel in the upper left corner of what is shown, so that a
 //! screenshot carries them, with what it costs itself on the submitting
-//! thread. Made again twice a second from the counters of
+//! thread. It shows the frame rate, a graph of the last frames' times and
+//! one of the frame rate over the last minute, every processor's load, the
+//! card's, its memory and the PC's, and a frame's work ([`super::hud`], in
+//! the system's own fonts); where no font can be had, the same numbers in
+//! white dot letters on a black box. Made again twice a second from the counters of
 //! the frame-rate line, memory and textures; a frame itself only copies the
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
 //! buffer, behind the title's picture: saved frames and the frame recorder
@@ -23,7 +26,12 @@ use super::font::{colours, glyph};
 use super::{Host, HostList, transition};
 
 /// How often the numbers change.
-const EVERY: Duration = Duration::from_millis(500);
+const EVERY: Duration = Duration::from_millis(250);
+
+/// Frames' times kept for the graph, and frame rates (one each [`EVERY`])
+/// for the last minute.
+const FRAMES_KEPT: usize = 240;
+const RATES_KEPT: usize = 240;
 
 /// A character's dots, and with the space beside and below it.
 const GLYPH: (u32, u32) = (5, 7);
@@ -209,8 +217,10 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
 
 /// The buffers of a box that size and format.
 struct Buffers {
-    shape: Shape,
+    size: (u32, u32),
     format: DXGI_FORMAT,
+    /// What they were made for (the dot scale, or the panel's scale in
+    /// thousandths).
     scale: u32,
     pitch: u32,
     uploads: Vec<(ID3D12Resource, *mut u8)>,
@@ -225,8 +235,7 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, shape: Shape, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(shape, scale);
+    fn new(host: &Host, (width, height): (u32, u32), format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -251,22 +260,32 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { shape, format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
+        Some(Buffers { size: (width, height), format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    /// The dot letters of `lines` in a box of `shape`.
+    fn write(&mut self, lines: &[String], shape: Shape) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.shape, self.scale, colours, self.pitch as usize);
+        let picture = painted(lines, shape, self.scale, colours, self.pitch as usize);
+        self.write_picture(&picture);
+    }
+
+    /// A picture of rows of the buffers' pitch.
+    fn write_picture(&mut self, picture: &[u8]) {
+        let bytes = (self.pitch * self.size.1) as usize;
+        if picture.len() != bytes {
+            return;
+        }
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
-        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, bytes) };
         self.fresh = true;
     }
 
     /// Records the copy of the box onto `back` (of `width` x `height`, in the
     /// state to be copied into), its upper left corner at `at`.
     fn copy(&mut self, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, at: (u32, u32), (width, height): (u32, u32)) {
-        let (w, h) = size(self.shape, self.scale);
+        let (w, h) = self.size;
         if at.0 >= width || at.1 >= height {
             return;
         }
@@ -303,6 +322,172 @@ impl Buffers {
     }
 }
 
+impl Buffers {
+    /// Records the pass that blends the picture (straight RGBA) over `back`
+    /// at its upper left corner: `back` in the state to be copied into, as
+    /// [`Buffers::copy`] has it, before and after.
+    fn blend(
+        &mut self,
+        host: &Host,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+        (width, height): (u32, u32),
+        format: DXGI_FORMAT,
+        (root, pipeline): &(ID3D12RootSignature, ID3D12PipelineState),
+    ) {
+        let (w, h) = (self.size.0.min(width), self.size.1.min(height));
+        // scRGB takes linear light; the other formats the bytes as they are.
+        let linear = u32::from(format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        let constants = [0u32, 0, w, h, self.pitch, linear];
+        // SAFETY: an open list and live resources; the view is recorded at once.
+        unsafe {
+            if std::mem::take(&mut self.fresh) {
+                list.CopyResource(&self.card, &self.uploads[self.turn].0);
+                list.ResourceBarrier(&[transition(&self.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+            }
+            list.ResourceBarrier(&[transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            let rtv = host.rtv(Some(back), None);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.SetGraphicsRootSignature(root);
+            list.SetPipelineState(pipeline);
+            list.SetGraphicsRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
+            list.SetGraphicsRootShaderResourceView(1, self.card.GetGPUVirtualAddress());
+            list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: width as f32, Height: height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
+            list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(3, 1, 0, 0);
+            list.ResourceBarrier(&[transition(back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+    }
+}
+
+/// The pass that blends the panel over the picture: one triangle over the
+/// whole of it, cut to the panel by the scissor; the pixel shader reads the
+/// panel's straight RGBA through a root view of its buffer (no descriptor
+/// heap) and gives it premultiplied, blended as such.
+const BLEND: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0, visibility = SHADER_VISIBILITY_PIXEL)"
+cbuffer Place : register(b0) { uint2 origin; uint2 size; uint pitch; uint linear_light; };
+ByteAddressBuffer picture : register(t0);
+[RootSignature(RS)]
+float4 corner(uint i : SV_VertexID) : SV_Position {
+    float2 uv = float2((i << 1) & 2, i & 2);
+    return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+[RootSignature(RS)]
+float4 panel(float4 p : SV_Position) : SV_Target {
+    uint2 at = uint2(p.xy) - origin;
+    if (at.x >= size.x || at.y >= size.y) discard;
+    uint word = picture.Load(at.y * pitch + at.x * 4);
+    float4 c = float4(word & 0xff, (word >> 8) & 0xff, (word >> 16) & 0xff, word >> 24) / 255.0;
+    if (linear_light != 0) {
+        float3 low = c.rgb / 12.92;
+        float3 high = pow((c.rgb + 0.055) / 1.055, 2.4);
+        c.rgb = lerp(low, high, step(0.04045, c.rgb));
+    }
+    return float4(c.rgb * c.a, c.a);
+}
+"#;
+
+/// The blending pass's root signature and its pipelines by format.
+struct Blender {
+    root: ID3D12RootSignature,
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+    made: std::sync::Mutex<Vec<(i32, Option<(ID3D12RootSignature, ID3D12PipelineState)>)>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Blender {}
+// SAFETY: as above.
+unsafe impl Sync for Blender {}
+
+/// The blending pass, compiled once; `None` if it cannot be.
+fn blender() -> Option<&'static Blender> {
+    static BLENDER: OnceLock<Option<Blender>> = OnceLock::new();
+    BLENDER
+        .get_or_init(|| {
+            use windows::core::s;
+            let host = super::host()?;
+            let made = (|| -> windows::core::Result<Blender> {
+                let ps = super::compile(BLEND, s!("panel"), s!("ps_5_1"))?;
+                // Both stages of one kind (as the depth planes' pass).
+                let vs = if crate::hlsl::is_dxil(&ps) {
+                    crate::hlsl::dxc_compile_for("the panel's corners", BLEND, "corner", "vs_6_0")?
+                } else {
+                    super::compile(BLEND, s!("corner"), s!("vs_5_1"))?
+                };
+                // SAFETY: the root signature is inside the pixel shader's code.
+                let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &ps)? };
+                Ok(Blender { root, vs, ps, made: std::sync::Mutex::default() })
+            })();
+            match made {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the numbers panel is copied over the picture: its blending pass could not be compiled");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+impl Blender {
+    /// The pipeline for a picture of `format`, made once.
+    fn pipeline(&self, host: &Host, format: DXGI_FORMAT) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = made.iter().find(|(f, _)| *f == format.0) {
+            return p.clone();
+        }
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() };
+        let target = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+        formats[0] = format;
+        // SAFETY: the description points at live data and never releases its pointer.
+        let pipeline = unsafe {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&self.root),
+                VS: code(&self.vs),
+                PS: code(&self.ps),
+                BlendState: D3D12_BLEND_DESC { RenderTarget: [target; 8], ..Default::default() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc)
+        };
+        let p = match pipeline {
+            Ok(pso) => Some((self.root.clone(), pso)),
+            Err(e) => {
+                tracing::warn!(error = %e, format = format.0, "the numbers panel is copied over the picture: no blending pipeline for this format");
+                None
+            }
+        };
+        made.push((format.0, p.clone()));
+        p
+    }
+}
+
 /// The panel of a presenter.
 pub(super) struct Panel {
     since: Instant,
@@ -316,6 +501,15 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The numbers as the panel shows them, and what they need kept.
+    snapshot: super::hud::Snapshot,
+    times: std::collections::VecDeque<f32>,
+    rates: std::collections::VecDeque<f32>,
+    processors: Vec<(u64, u64)>,
+    process: (u64, Instant),
+    /// The fonts, once made; whether they could not be.
+    fonts: Option<super::hud::Type>,
+    no_fonts: bool,
 }
 
 impl Panel {
@@ -332,6 +526,13 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            snapshot: super::hud::Snapshot::default(),
+            times: std::collections::VecDeque::with_capacity(FRAMES_KEPT),
+            rates: std::collections::VecDeque::with_capacity(RATES_KEPT),
+            processors: processor_times(),
+            process: (process_time(), now),
+            fonts: None,
+            no_fonts: false,
         }
     }
 
@@ -352,8 +553,15 @@ impl Panel {
             self.frames = 0;
         }
         self.frames += 1;
-        self.worst = self.worst.max((now - self.last).as_secs_f64() * 1e3);
+        let took = (now - self.last).as_secs_f64() * 1e3;
+        self.worst = self.worst.max(took);
         self.last = now;
+        if self.frames > 1 || took < 2e3 {
+            if self.frame_times_full() {
+                self.frame_times_pop();
+            }
+            self.frame_times_push(took as f32);
+        }
         let elapsed = now - self.since;
         if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
@@ -364,7 +572,9 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        let ms = elapsed.as_secs_f64() * 1e3 / frames;
+        self.lines = text(&c, ms, self.worst, cost, host);
+        self.snapshot = self.snapshot(&c, ms, cost, host, now);
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -387,20 +597,232 @@ impl Panel {
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
-        let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+        // The panel in the system's fonts, made at the first draw; else the
+        // dot letters.
+        let k = super::hud::scale(height);
+        if self.fonts.as_ref().is_none_or(|t| t.scale() != k) && !self.no_fonts {
+            let (w, _) = super::hud::size(k);
+            self.fonts = super::hud::Type::new((w, (72.0 * k).ceil() as u32), k);
+            self.no_fonts = self.fonts.is_none();
+            if self.no_fonts {
+                tracing::info!("no fonts for the numbers panel: its dot letters instead");
+            }
+        }
+        let fancy = self.fonts.is_some() && colours(format).is_some();
+        // Blended onto the picture where the pass can be made (its buffers
+        // hold RGBA), else copied over it.
+        let blended = fancy && blender().is_some_and(|b| b.pipeline(host, format).is_some());
+        let held = if blended { DXGI_FORMAT_R8G8B8A8_UNORM } else { format };
+        let (size, scale) = if fancy {
+            (super::hud::size(k), (k * 1000.0).round() as u32 * 2 + u32::from(blended))
+        } else {
+            let scale = scale(height);
+            (size(PANEL, scale), scale)
+        };
+        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale, b.size) != (held, scale, size)) {
             // (What the card may still read stays: a picture's size changes once or twice in a run.)
             std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, PANEL, format, scale);
+            self.buffers = Buffers::new(host, size, held, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
         let Some(buffers) = &mut self.buffers else { return };
         if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
+            match &mut self.fonts {
+                Some(fonts) if fancy => {
+                    let picture = super::hud::paint(fonts, &self.snapshot);
+                    if blended {
+                        buffers.write_picture(&picture.rgba(buffers.pitch as usize));
+                    } else if let Some(bytes) = picture.encode(format, buffers.pitch as usize) {
+                        buffers.write_picture(&bytes);
+                    }
+                    save_now_and_then(&picture);
+                }
+                _ => buffers.write(&self.lines, PANEL),
+            }
+        }
+        if blended && let Some(pipeline) = blender().and_then(|b| b.pipeline(host, format)) {
+            buffers.blend(host, &list.list, back, (width, height), format, &pipeline);
+            self.cost += began.elapsed();
+            return;
         }
         buffers.copy(&list.list, back, (0, 0), (width, height));
         self.cost += began.elapsed();
+    }
+}
+
+impl Panel {
+    fn frame_times_full(&self) -> bool {
+        self.times.len() >= FRAMES_KEPT
+    }
+
+    fn frame_times_pop(&mut self) {
+        self.times.pop_front();
+    }
+
+    fn frame_times_push(&mut self, ms: f32) {
+        self.times.push_back(ms);
+    }
+
+    /// The numbers for the panel's picture: `c` [`Counters`] per frame, `ms`
+    /// a frame's time, `cost` the panel's own per frame.
+    fn snapshot(&mut self, c: &[f64; COUNTERS], ms: f64, cost: f64, host: &Host, now: Instant) -> super::hud::Snapshot {
+        let fps = 1e3 / ms.max(0.001);
+        if self.rates.len() >= RATES_KEPT {
+            self.rates.pop_front();
+        }
+        self.rates.push_back(fps as f32);
+        // Each processor, and the whole, since the last look.
+        let processors = processor_times();
+        let mut cores = Vec::with_capacity(processors.len());
+        let (mut busy, mut all) = (0u64, 0u64);
+        for (i, &(b, t)) in processors.iter().enumerate() {
+            let (b0, t0) = self.processors.get(i).copied().unwrap_or((b, t));
+            let (db, dt) = (b.saturating_sub(b0), t.saturating_sub(t0));
+            cores.push(if dt > 0 { (db as f64 / dt as f64) as f32 } else { 0.0 });
+            (busy, all) = (busy + db, all + dt);
+        }
+        self.processors = processors;
+        let process = process_time();
+        let wall = (now - self.process.1).as_secs_f64();
+        let ours = if wall > 0.0 { process.saturating_sub(self.process.0) as f64 / 1e7 / wall } else { 0.0 };
+        self.process = (process, now);
+        let mut sorted: Vec<f32> = self.times.iter().copied().collect();
+        sorted.sort_by(f32::total_cmp);
+        let slow = sorted.get(sorted.len().saturating_sub(1).min(sorted.len() * 99 / 100)).map_or(0.0, |&v| f64::from(v));
+        let (working, private) = process_memory();
+        let held = linux_resident().unwrap_or(private);
+        let [budget, used, _, _] = host.video_memory().unwrap_or_default();
+        let idle = (c[1] / 1e3).min(ms);
+        super::hud::Snapshot {
+            fps,
+            ms,
+            worst: self.worst,
+            slow,
+            frames: self.times.iter().copied().collect(),
+            rates: self.rates.iter().copied().collect(),
+            shown_per: crate::streamline::shown_per_frame().max(1),
+            cores,
+            system: if all > 0 { busy as f64 / all as f64 } else { 0.0 },
+            ours,
+            gpu: if ms > 0.0 { ((ms - idle) / ms).clamp(0.0, 1.0) } else { 0.0 },
+            vram: (used, budget),
+            ram: (held, working, physical_memory()),
+            draws: c[10],
+            dropped: c[8],
+            submit: c[0] / 1e3,
+            waits: c[3] / 1e3,
+            up: c[7] / 1e6,
+            textures: c[4] / 1e6,
+            back: c[5] / 1e3,
+            making: crate::pipeline::making(),
+            cost,
+            tape: crate::feed::recent(12),
+            counts: crate::feed::counts(),
+        }
+    }
+}
+
+/// With `VICTORY_HUD_PICTURE=<folder>`, the panel's own picture (nothing
+/// of the title's) as `hud-live.ppm` there, every five seconds: to look at
+/// it without a screenshot.
+fn save_now_and_then(picture: &super::hud::Canvas) {
+    static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let Some(folder) = FOLDER.get_or_init(|| std::env::var_os("VICTORY_HUD_PICTURE").map(Into::into)) else { return };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+        return;
+    }
+    *last = Some(Instant::now());
+    let mut ppm = format!("P6 {} {} 255\n", picture.width, picture.height).into_bytes();
+    for y in 0..picture.height {
+        for x in 0..picture.width {
+            let super::hud::Rgb(r, g, b) = picture.at(x, y);
+            ppm.extend([r, g, b]);
+        }
+    }
+    let _ = std::fs::write(folder.join("hud-live.ppm"), ppm);
+}
+
+/// Each processor's busy and whole time since the start (100 ns), from
+/// Windows (under Wine, from Linux's `/proc/stat`); empty if it says nothing.
+fn processor_times() -> Vec<(u64, u64)> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    /// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Times {
+        idle: i64,
+        kernel: i64,
+        user: i64,
+        dpc: i64,
+        interrupt: i64,
+        interrupts: u32,
+    }
+    type Query = unsafe extern "system" fn(u32, *mut core::ffi::c_void, u32, *mut u32) -> i32;
+    static QUERY: OnceLock<Option<Query>> = OnceLock::new();
+    // SAFETY: ntdll's own export, of this signature.
+    let query = *QUERY.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return None;
+        }
+        GetProcAddress(ntdll, c"NtQuerySystemInformation".as_ptr().cast()).map(|f| std::mem::transmute::<_, Query>(f))
+    });
+    let Some(query) = query else { return Vec::new() };
+    let mut times = vec![Times::default(); 256];
+    let mut got = 0u32;
+    // SAFETY: room for 256 processors; class 8 is SystemProcessorPerformanceInformation.
+    let status = unsafe { query(8, times.as_mut_ptr().cast(), (times.len() * size_of::<Times>()) as u32, &mut got) };
+    if status < 0 {
+        return Vec::new();
+    }
+    let n = (got as usize / size_of::<Times>()).min(times.len());
+    times[..n]
+        .iter()
+        .map(|t| {
+            // (Kernel time holds idle time.)
+            let whole = (t.kernel.max(0) + t.user.max(0)) as u64;
+            (whole.saturating_sub(t.idle.max(0) as u64), whole)
+        })
+        .collect()
+}
+
+/// The process's CPU time since its start (100 ns), all threads.
+fn process_time() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut made, mut ended, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: our own process; room for the answers.
+    unsafe { GetProcessTimes(GetCurrentProcess(), &mut made, &mut ended, &mut kernel, &mut user) };
+    let t = |f: FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
+    t(kernel) + t(user)
+}
+
+/// Under Wine, the memory Linux holds for this process that cannot be
+/// given back without swap: resident anonymous and shared memory (the
+/// title's memory is in shared sections, which Windows' private bytes leave
+/// out). `None` on Windows. (NVIDIA's pins of buffers are not in it.)
+fn linux_resident() -> Option<u64> {
+    let status = std::fs::read_to_string(r"Z:\proc\self\status").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        let line = status.lines().find(|l| l.starts_with(name))?;
+        line[name.len()..].trim().trim_end_matches("kB").trim().parse::<u64>().ok().map(|kb| kb * 1024)
+    };
+    Some(field("RssAnon:")? + field("RssShmem:").unwrap_or(0))
+}
+
+/// The PC's memory in bytes.
+fn physical_memory() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a sized structure.
+    unsafe {
+        let mut m: MEMORYSTATUSEX = std::mem::zeroed();
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        GlobalMemoryStatusEx(&mut m);
+        m.ullTotalPhys
     }
 }
 
@@ -450,7 +872,7 @@ impl Notice {
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
             std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, self.shape, format, scale);
+            self.buffers = Buffers::new(host, size(self.shape, scale), format, scale);
             self.written = false;
             if self.buffers.is_none() {
                 self.done = true;
@@ -459,7 +881,7 @@ impl Notice {
         }
         let Some(buffers) = &mut self.buffers else { return };
         if !std::mem::replace(&mut self.written, true) {
-            buffers.write(&self.lines);
+            buffers.write(&self.lines, self.shape);
         }
         let (w, _) = size(self.shape, scale);
         let at = (width.saturating_sub(w) / 2, 24 * scale);

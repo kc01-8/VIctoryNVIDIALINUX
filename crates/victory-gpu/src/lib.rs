@@ -32,6 +32,7 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+mod feed;
 pub mod dxgi;
 #[cfg(windows)]
 mod external;

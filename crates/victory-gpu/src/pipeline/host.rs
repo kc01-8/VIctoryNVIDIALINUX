@@ -630,11 +630,13 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    crate::feed::note(crate::feed::Kind::Refused, || crate::feed::shaders(shaders));
                     host.log_messages();
                     return None;
                 }
             };
             tracing::info!(?shaders, "host pipeline");
+            crate::feed::note(crate::feed::Kind::Made, || crate::feed::shaders(shaders));
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
@@ -683,11 +685,13 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    crate::feed::note(crate::feed::Kind::Refused, || crate::feed::shaders(shaders));
                     host.log_messages();
                     return None;
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
+            crate::feed::note(crate::feed::Kind::Made, || crate::feed::shaders(shaders));
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -780,6 +784,7 @@ impl HostPipeline {
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
+            crate::feed::note(crate::feed::Kind::Refused, || crate::feed::shaders(shaders));
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
@@ -789,11 +794,13 @@ impl HostPipeline {
             Ok(pso) => pso,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                crate::feed::note(crate::feed::Kind::Refused, || crate::feed::shaders(shaders));
                 host.log_messages();
                 return None;
             }
         };
         tracing::info!(?shaders, "host pipeline");
+        crate::feed::note(crate::feed::Kind::Made, || crate::feed::shaders(shaders));
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
