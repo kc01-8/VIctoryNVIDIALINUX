@@ -763,15 +763,20 @@ pub(super) fn chrome(
                     escaped(&site)
                 )?;
             }
-            _ => write!(
-                out,
-                ",\n{{\"ph\":\"X\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"dur\":{dur:.1},\"cat\":\"{:?}\",\"name\":\"{}\",\
-                 \"args\":{{\"a\":{},\"b\":{},\"cpu\":{cpu}}}}}",
-                e.kind,
-                escaped(e.name),
-                e.a,
-                e.b
-            )?,
+            _ => {
+                // (A kernel call this long has who asked: [`super::record::kernel`].)
+                let site = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s)).map_or(String::new(), |s| names.site(s));
+                write!(
+                    out,
+                    ",\n{{\"ph\":\"X\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"dur\":{dur:.1},\"cat\":\"{:?}\",\"name\":\"{}\",\
+                     \"args\":{{\"a\":{},\"b\":{},\"cpu\":{cpu},\"at\":\"{}\"}}}}",
+                    e.kind,
+                    escaped(e.name),
+                    e.a,
+                    e.b,
+                    escaped(&site)
+                )?
+            }
         }
     }
     for r in trace.runs.iter().filter(|r| r.on != (0, 0)) {

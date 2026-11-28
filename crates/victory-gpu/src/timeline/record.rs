@@ -292,8 +292,12 @@ pub(super) fn woken(name: &'static str, object: u64) {
 /// A call of the kernel's on `bytes` began at `t0`.
 pub(super) fn kernel(name: &'static str, bytes: u64, t0: u64) {
     let t1 = ticks();
-    if micros(t1 - t0) >= 20 {
-        put(Kind::Kernel, name, (t0, t1), bytes, 0, 0);
+    let us = micros(t1 - t0);
+    if us >= 20 {
+        // (Who asked, for one this long: which of our calls wait on the
+        // system's lock for the address space, under Wine one for all.)
+        let stack = if us >= DEEP { stack() } else { 0 };
+        put(Kind::Kernel, name, (t0, t1), bytes, 0, stack);
     }
 }
 

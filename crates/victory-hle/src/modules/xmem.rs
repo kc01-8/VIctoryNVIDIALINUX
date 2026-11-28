@@ -2673,6 +2673,7 @@ fn materialize_for(at: usize, len: usize, touch: Touch) -> bool {
     if HOLDING.get() {
         return false;
     }
+    let _making = victory_gpu::timeline::span("a lazy view made real");
     let physical = physical();
     let bases = overlapping(&LAZY.read().unwrap_or_else(|e| e.into_inner()));
     let mut all = !bases.is_empty();

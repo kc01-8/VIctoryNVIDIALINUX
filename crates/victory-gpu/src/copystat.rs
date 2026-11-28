@@ -552,7 +552,13 @@ fn system_memory() -> (u64, u64) {
 /// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
+    // (Not while a timeline is asked for: under Wine its walk of the address
+    // space, thousands of queries under the system's one lock for it, held
+    // everyone else's queries up and filled the frames' chains, run 66.)
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_MEMORY_MAP") {
+        Some(v) => v != "0",
+        None => std::env::var_os("VICTORY_TIMELINE").is_none(),
+    })
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
