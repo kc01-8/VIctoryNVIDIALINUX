@@ -723,7 +723,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize, (usize, u32, u32))) -> usize {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
@@ -3186,7 +3186,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -3210,7 +3210,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -3288,7 +3288,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -4049,6 +4049,7 @@ impl Shadow {
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
                     // no two pages are the same.
+                    let _merging = crate::timeline::span("under: a page merged under flights' writes");
                     let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
@@ -5406,6 +5407,41 @@ pub(crate) fn in_place_gone() -> u64 {
     IN_PLACE_GONE.load(Ordering::Acquire)
 }
 
+/// Title memory mapped anew lately, for windows made with no lock held
+/// ([`reads_end`]): a count of such changes, and the last ones (number,
+/// start, end). Written with [`LOOSE`] held for writing.
+static MAPPING_CHANGES: Mutex<(u64, std::collections::VecDeque<(u64, u64, u64)>)> = Mutex::new((0, std::collections::VecDeque::new()));
+
+/// Changes kept: more than come while one window is made.
+const MAPPING_CHANGES_KEPT: usize = 1024;
+
+/// Notes that the title mapped `[at, end)` anew (with [`LOOSE`] held).
+fn note_mapping_change(at: u64, end: u64) {
+    let mut c = MAPPING_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+    c.0 += 1;
+    let n = c.0;
+    if c.1.len() >= MAPPING_CHANGES_KEPT {
+        c.1.pop_front();
+    }
+    c.1.push_back((n, at, end));
+}
+
+/// The count of changes so far.
+fn mapping_changes_now() -> u64 {
+    MAPPING_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).0
+}
+
+/// Whether a change after `before` touched `[at, end)` (or more came than
+/// are kept, so that it cannot be told).
+fn mapping_changed_since(before: u64, at: u64, end: u64) -> bool {
+    let c = MAPPING_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if c.0 == before {
+        return false;
+    }
+    let oldest = c.1.front().map_or(c.0, |&(n, _, _)| n);
+    oldest > before + 1 || c.1.iter().any(|&(n, a, e)| n > before && a < end && e > at)
+}
+
 /// Marks copies in place as taken out of the tables, then counts them.
 fn mark_gone(gone: &[Arc<Shadow>]) {
     for shadow in gone {
@@ -5428,6 +5464,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        note_mapping_change(at, end);
         let keys: Vec<(u64, u64)> = in_place_over(&map, at, end)
             .into_iter()
             // Windows over the pool through views of our own go only when
@@ -5469,6 +5506,7 @@ pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -
     let (mut kept, mut marked) = (0, 0);
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        note_mapping_change(at, end);
         let mut keys = Vec::new();
         for key in in_place_over(&map, at, end) {
             let Some(views) = map.get(&key).and_then(|shadow| shadow.views.as_ref()) else { continue };
@@ -5500,7 +5538,7 @@ pub(crate) fn own_views_mapped(at: u64, len: u64, section: usize, offset: u64) -
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -5775,7 +5813,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -5948,14 +5986,48 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // Made with no lock held: a window takes milliseconds under Wine (views
+    // of the page pool mapped through the wineserver, buffers made), and
+    // every reader of the table waited for it, landings and refreshes among
+    // them (run 62's timeline: landing jobs waiting 17-19 ms at a time on
+    // it). Another thread may make the same window meanwhile: then its is
+    // taken and ours goes. One in place over memory the title mapped anew
+    // meanwhile may show the old pages: made again under the lock, as before.
+    let before = mapping_changes_now();
+    drop(map);
+    let made = make_window(start, len)?;
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(theirs) = map.get(&(start, len)) {
+        let theirs = theirs.clone();
+        drop(map);
+        drop(made);
+        note(&theirs);
+        return Some(theirs);
+    }
+    let made = if made.in_place() && mapping_changed_since(before, start, start + len) {
+        drop(made);
+        make_window(start, len)?
+    } else {
+        made
+    };
+    if made.card.is_some() {
+        carded(&made);
+    }
+    note(&made);
+    map.insert((start, len), made.clone());
+    if made.in_place() {
+        index_in_place((start, len));
+    }
+    Some(made)
+}
+
+/// The window of title memory `[start, start + len)`: in place where it can
+/// be, else a copy ([`reads_end`], which puts it in the table).
+fn make_window(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        index_in_place((start, len));
-        return Some(shadow);
+        return Some(Arc::new(Shadow::placed(placed, start, len, true)));
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
@@ -5965,10 +6037,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return Some(Arc::new(shadow));
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -6000,13 +6069,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        carded(&shadow);
-    }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    Some(Arc::new(shadow))
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
