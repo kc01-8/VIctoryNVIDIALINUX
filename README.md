@@ -88,6 +88,7 @@ days** (2026-11-26 to 2026-11-27) and 44 recorded runs.
 | 11-27 | runs 37–43 | The sampling profiler found to crash the title; write faults without the guards' lock; the wineserver's requests traced; the root signatures Wine's compiler drops sent to DXC | **8.4–14 fps** at 1,400–3,700 draws; the depth planes, the scatter, the upload check, the tiles' look and keeping the card awake all working |
 | 11-28 | run 44 | 48 KiB of shared memory for thread groups; a CPU profile with `perf` | NVIDIA's shader compiler is 46 % of CPU samples three minutes in: compiled pipelines are not kept between runs |
 | 11-28 | runs 45–51 | NVIDIA's shader cache kept between runs; the title borderless at the screen's size; the numbers panel | a second run has half the pipelines left to compile at 90 s; the picture no longer resampled; 11.8–12.7 GB |
+| 11-28 | runs 52–56 | trustno1's 64 newer commits, foxhound 0.2.0-pre.4's settings and hyphennn's static-sampler order brought over; write faults under the guards' lock again | **every pipeline made by 90 seconds** on a second start (NVIDIA's compiler had been 41–46 % of the CPU in play); no more early stops (all five came of unlocked write faults); 12.1–12.3 GB |
 
 ## What this fork adds for Linux
 
@@ -113,6 +114,7 @@ All of it is in `kc/foxhound`, each with its own commit and measurements.
 - **NVIDIA's shader cache under umu.** The launcher gives the driver a cache folder of its own (`~/.cache/victory/nvidia`) and a size it takes (under 4 GiB), so compiled pipelines are kept between runs.
 - **The title borderless at the screen's size** (`VICTORY_FULLSCREEN=1` in the profile), so the picture is shown pixel for pixel.
 - **A numbers panel** (`VICTORY_PANEL=1`, F3): drawn on the CPU in the system's own fonts through GDI (no font ships with it), copied onto the picture. Under Wine its RAM is the process's own proportional anonymous and shared memory from Linux (`/proc/<pid>/smaps_rollup`; `Z:\proc\self` is the wineserver's).
+- **Pipelines compiled once.** NVIDIA's cache only answers for a pipeline whose static samplers sit where they sat before; hyphennn's kept order (`pipeline/sampler_order.rs`, picked from fxceless/victory-fork) makes them, and a second start has every pipeline made within 90 seconds.
 - **No downloads.** trustno1's launcher fetched DLSS, FSR, the Direct3D 12 runtime and a mod; here those commands say where to put the files and stop.
 
 ## Where it stands, in detail
@@ -151,8 +153,8 @@ The prefix's shader cache is empty: compiled pipelines are not reused from one r
 
 Ranked by what they should give. Each item names where to start.
 
-1. **Bring over trustno1's, foxhound's and hyphennn's newer fixes** (about 70 commits on trustno1 alone; foxhound 0.2.0-pre.4's long-session fixes; hyphennn's static samplers in one order, so pipelines are not recompiled at every start). As cherry-picks: merging their history would bring back the BCPack tables.
-2. **Compiled pipelines.** NVIDIA's cache is now kept between runs; what is still compiled in play, and victory's own pipeline library (only 565 KB, `crates/victory-gpu/src/pipeline/library.rs`), are next.
+1. **The title's threads' system calls.** With pipelines compiled ahead, a quarter of the CPU's samples are the kernel on the title's threads, mostly entering and leaving system calls (Wine's sync objects, `getrusage`), with the processor's speculation mitigations on every return. Which calls, and which can stay in user space.
+2. **The title's own frame loop.** In some stretches its main thread spins in a lookup of its pools' object handles until another thread adds one (`VICTORY_HANDLE_TABLE=1` reports the table); what that thread waits on.
 3. **The page pool without the wineserver or pinned copies.** Fewer, larger views; or keeping the views and remapping only what the title remaps (`crates/victory-gpu/src/inplace.rs`, `shadow.rs`).
 4. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point.
 5. **The meshlet program.** Run with `VICTORY_WAVE_WHY=1` to see what stops it now that 48 KiB fit (`crates/victory-shader/src/emit/lower.rs`).
