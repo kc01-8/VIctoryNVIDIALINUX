@@ -60,6 +60,13 @@ if [[ $VKD3D_SHADER_CACHE_PATH != 0 ]]; then
     mkdir -p -- "$VKD3D_SHADER_CACHE_PATH"
 fi
 mkdir -p -- "$DXVK_STATE_CACHE_PATH"
+# NVIDIA's own cache of compiled pipelines, in a folder of its own: under
+# umu nothing sets one (Steam does, for its games), and vkd3d-proton's cache
+# above keeps only SPIR-V, so without it every run compiles every pipeline
+# again (run 44: NVIDIA's compiler was 46 % of the CPU three minutes in).
+export __GL_SHADER_DISK_CACHE=${__GL_SHADER_DISK_CACHE:-1}
+export __GL_SHADER_DISK_CACHE_PATH=${__GL_SHADER_DISK_CACHE_PATH:-$cache_home/victory/nvidia}
+mkdir -p -- "$__GL_SHADER_DISK_CACHE_PATH"
 # DXC for the helper shaders Wine's compiler refuses (docs/kc-linux-status.md):
 # a Linux path to dxcompiler.dll or its folder is handed over on Z:.
 if [[ ${VICTORY_BCPACK_TABLES:-} == /* ]]; then

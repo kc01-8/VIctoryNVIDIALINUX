@@ -71,7 +71,9 @@ export WINEPREFIX=${WINEPREFIX:-$data_home/victory/proton}
 export GAMEID=${GAMEID:-umu-victory}
 export VICTORY_LOG=${VICTORY_LOG:-info}
 # A new area builds thousands of pipelines; keep the driver's cache for them.
-export __GL_SHADER_DISK_CACHE_SIZE=${__GL_SHADER_DISK_CACHE_SIZE:-17179869184}
+# Under 4 GiB: run 44's 16 GiB (2^34) left the cache unwritten, as if read
+# into 32 bits as 0.
+export __GL_SHADER_DISK_CACHE_SIZE=${__GL_SHADER_DISK_CACHE_SIZE:-4294967295}
 export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}
 if [[ -z ${VICTORY_DXC:-} && -n ${KC_DXC_DIR:-} ]]; then
     export VICTORY_DXC=$KC_DXC_DIR
