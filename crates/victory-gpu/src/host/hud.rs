@@ -338,6 +338,13 @@ pub(super) struct Type {
     quality: FONT_QUALITY,
 }
 
+/// Letters are drawn this many times wider and averaged down across: at
+/// panel sizes Wine's GDI hints them hard to the pixel grid both ways
+/// (crusty, uneven); three times wider, their shapes across come out
+/// nearly as drawn, while their height is still hinted to whole rows
+/// (baselines and tops sharp), as the desktop's light hinting does.
+const OVER: i32 = 3;
+
 // SAFETY: used by the presenting thread alone, under the presenter's lock.
 unsafe impl Send for Type {}
 
@@ -350,6 +357,8 @@ impl Type {
     /// For a canvas `size` wide and texts at `scale`; `None` without GDI or
     /// a bitmap to draw into.
     pub(super) fn new(size: (u32, u32), scale: f32) -> Option<Type> {
+        // (Room for the letters drawn wider.)
+        let size = (size.0 * OVER as u32, size.1);
         let header = BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: size.0 as i32,
@@ -440,11 +449,24 @@ impl Type {
         }
         let (px, weight, mono) = style.form();
         let face = &self.faces[usize::from(mono)];
+        let height = -((px * self.scale).round() as i32).max(6);
+        // Its letters' width as made, then a font three times as wide.
+        // SAFETY: fonts made from a NUL-terminated name we hold, one measured
+        // and deleted.
+        let width = unsafe {
+            let font = CreateFontW(height, 0, 0, 0, weight as i32, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, self.quality, 0, PCWSTR(face.as_ptr()));
+            let old = SelectObject(self.dc, font.into());
+            let mut metrics = TEXTMETRICW::default();
+            let _ = GetTextMetricsW(self.dc, &mut metrics);
+            SelectObject(self.dc, old);
+            let _ = DeleteObject(font.into());
+            metrics.tmAveCharWidth.max(1) * OVER
+        };
         // SAFETY: a font made from a NUL-terminated name we hold.
         let font = unsafe {
             CreateFontW(
-                -((px * self.scale).round() as i32).max(6),
-                0,
+                height,
+                width,
                 0,
                 0,
                 weight as i32,
@@ -499,8 +521,14 @@ impl Type {
         self.scale
     }
 
-    /// The size of `s` in `style`.
+    /// The size of `s` in `style`, in the canvas's pixels.
     pub(super) fn measure(&mut self, s: &str, style: Style) -> (i32, i32) {
+        let (w, h) = self.measure_drawn(s, style);
+        ((w + OVER - 1) / OVER, h)
+    }
+
+    /// The size of `s` in `style` as drawn, wider.
+    fn measure_drawn(&mut self, s: &str, style: Style) -> (i32, i32) {
         let font = self.font(style);
         let text: Vec<u16> = s.encode_utf16().collect();
         let mut size = SIZE::default();
@@ -521,8 +549,9 @@ impl Type {
     /// [`Type::write`] at `opacity` (0 to 1).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write_faded(&mut self, canvas: &mut Canvas, x: i32, y: i32, s: &str, style: Style, colour: Rgb, align: Align, opacity: f32) -> i32 {
-        let (w, h) = self.measure(s, style);
-        let (w, h) = (w.min(self.size.0 as i32), h.min(self.size.1 as i32));
+        let (dw, dh) = self.measure_drawn(s, style);
+        let (dw, dh) = (dw.min(self.size.0 as i32), dh.min(self.size.1 as i32));
+        let (w, h) = ((dw + OVER - 1) / OVER, dh);
         if w <= 0 || h <= 0 {
             return 0;
         }
@@ -536,16 +565,30 @@ impl Type {
         // after the flush.
         unsafe {
             let bits = std::slice::from_raw_parts_mut(self.bits, stride * self.size.1 as usize);
-            for row in 0..h as usize {
-                bits[row * stride..row * stride + w as usize].fill(0);
+            let (rows, cols) = (h as usize, (w * OVER) as usize);
+            for row in 0..rows.min(self.size.1 as usize) {
+                bits[row * stride..row * stride + cols.min(stride)].fill(0);
             }
             let _ = TextOutW(self.dc, 0, 0, &text);
             let _ = GdiFlush();
+            let tall = self.size.1 as usize;
+            let quality = self.quality;
+            let cover_at = |x: usize, y: usize| -> u32 {
+                if x >= stride || y >= tall {
+                    return 0;
+                }
+                let p = bits[y * stride + x];
+                let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
+                if quality == CLEARTYPE_QUALITY { (r + g + b) / 3 } else { r.max(g).max(b) }
+            };
             for row in 0..h {
                 for col in 0..w {
-                    let p = bits[row as usize * stride + col as usize];
-                    let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
-                    let cover = if self.quality == CLEARTYPE_QUALITY { (r + g + b) / 3 } else { r.max(g).max(b) };
+                    // The mean of the wider letters' pixels across this one.
+                    let mut sum = 0;
+                    for i in 0..OVER as usize {
+                        sum += cover_at(col as usize * OVER as usize + i, row as usize);
+                    }
+                    let cover = sum / OVER as u32;
                     if cover > 0 {
                         canvas.blend(left + col, y + row, colour, sharpened(cover) * opacity);
                     }

@@ -817,18 +817,27 @@ fn process_time() -> u64 {
 /// each page once. `None` on Windows. (NVIDIA's pins of buffers are not in
 /// it.)
 ///
-/// Proportional sizes (`Pss_Anon`, `Pss_Shmem` of `/proc/self/smaps_rollup`)
-/// count a page mapped at two addresses once, as the title's pages are
-/// (their views and ours); `RssShmem` counts it twice (12.7 GB of shared
-/// memory against the cgroup's 6.7 GB). Walking every mapping takes time,
-/// so a thread of its own reads it every two seconds.
+/// Proportional sizes (`Pss_Anon`, `Pss_Shmem` of `smaps_rollup`) count a
+/// page mapped at two addresses once, as the title's pages are (their views
+/// and ours); `RssShmem` counts it twice (12.7 GB of shared memory against
+/// the cgroup's 6.7 GB). Walking every mapping takes time, so a thread of
+/// its own reads it every two seconds.
+///
+/// Not `/proc/self`: under Wine that is the wineserver's (a file opened
+/// through drive Z: is looked up by it), so the panel showed its 16 MB.
+/// Our own process is the `victory.exe` in `/proc` with the most threads.
 fn linux_resident() -> Option<u64> {
     use std::sync::atomic::AtomicU64;
     static HELD: AtomicU64 = AtomicU64::new(0);
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
-        let read = || -> Result<u64, String> {
-            let text = std::fs::read_to_string(r"Z:\proc\self\smaps_rollup").map_err(|e| e.to_string())?;
+        let Some(pid) = own_linux_process() else {
+            tracing::info!("the numbers panel's RAM: Windows' private bytes (no Linux process of ours found)");
+            return;
+        };
+        let rollup = format!(r"Z:\proc\{pid}\smaps_rollup");
+        let read = move || -> Result<u64, String> {
+            let text = std::fs::read_to_string(&rollup).map_err(|e| e.to_string())?;
             let field = |name: &str| -> Option<u64> {
                 let line = text.lines().find(|l| l.starts_with(name))?;
                 line[name.len()..].trim().trim_end_matches("kB").trim().parse::<u64>().ok().map(|kb| kb * 1024)
@@ -840,7 +849,7 @@ fn linux_resident() -> Option<u64> {
         };
         match read() {
             Ok(bytes) => {
-                tracing::info!(mb = bytes >> 20, "the numbers panel's RAM: the process's anonymous and shared memory, from Linux");
+                tracing::info!(pid, mb = bytes >> 20, "the numbers panel's RAM: the process's anonymous and shared memory, from Linux");
                 HELD.store(bytes, Ordering::Relaxed);
                 let _ = std::thread::Builder::new().name("victory-panel-ram".into()).spawn(move || {
                     loop {
@@ -857,6 +866,26 @@ fn linux_resident() -> Option<u64> {
     });
     let held = HELD.load(Ordering::Relaxed);
     (held > 0).then_some(held)
+}
+
+/// Under Wine, the Linux process this is: of the processes named
+/// `victory.exe` in `/proc`, the one with the most threads; `None` without
+/// a `/proc` (Windows).
+fn own_linux_process() -> Option<u32> {
+    let mut best: Option<(u32, u32)> = None;
+    for entry in std::fs::read_dir(r"Z:\proc").ok()?.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(status) = std::fs::read_to_string(format!(r"Z:\proc\{pid}\status")) else { continue };
+        let field = |name: &str| status.lines().find(|l| l.starts_with(name)).map(|l| l[name.len()..].trim().to_owned());
+        if field("Name:").is_none_or(|n| !n.eq_ignore_ascii_case("victory.exe")) {
+            continue;
+        }
+        let threads = field("Threads:").and_then(|t| t.parse::<u32>().ok()).unwrap_or(0);
+        if best.is_none_or(|(_, most)| threads > most) {
+            best = Some((pid, threads));
+        }
+    }
+    best.map(|(pid, _)| pid)
 }
 
 /// The PC's memory in bytes.
@@ -982,12 +1011,15 @@ mod tests {
         }
     }
 
-    /// Under Wine the process's memory is read from Linux's own books, and
-    /// is more than nothing; on Windows there are none.
+    /// Under Wine our own Linux process is found (a test binary is no
+    /// `victory.exe`: none, and its memory is not read); on Windows there
+    /// is no `/proc`.
     #[test]
-    fn resident_memory_is_read() {
-        if std::fs::metadata(r"Z:\proc\self\smaps_rollup").is_ok() {
-            assert!(linux_resident().is_some_and(|b| b > 1 << 20));
+    fn our_linux_process_is_looked_for() {
+        if std::fs::metadata(r"Z:\proc").is_ok() {
+            assert!(own_linux_process().is_none() || linux_resident().is_some());
+        } else {
+            assert!(own_linux_process().is_none());
         }
     }
 
