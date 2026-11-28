@@ -497,6 +497,48 @@ impl Blender {
     }
 }
 
+/// The panel's numbers the system is asked for, on the painter's thread:
+/// each processor's time, the process's, its memory and the PC's, the card's
+/// memory. Under Wine these go through `/proc` and the wineserver, and on
+/// the presenting thread they were most of a frame's chain (with the F1
+/// menu and the frame meter, 762 ms in 6 frames, run 67's timeline).
+struct SystemNumbers {
+    processors: Vec<(u64, u64)>,
+    process: (u64, Instant),
+}
+
+impl SystemNumbers {
+    fn new() -> SystemNumbers {
+        SystemNumbers { processors: processor_times(), process: (process_time(), Instant::now()) }
+    }
+
+    /// Puts them in `s`.
+    fn fill(&mut self, s: &mut super::hud::Snapshot) {
+        let now = Instant::now();
+        let processors = processor_times();
+        let (mut busy, mut all) = (0u64, 0u64);
+        s.cores.clear();
+        for (i, &(b, t)) in processors.iter().enumerate() {
+            let (b0, t0) = self.processors.get(i).copied().unwrap_or((b, t));
+            let (db, dt) = (b.saturating_sub(b0), t.saturating_sub(t0));
+            s.cores.push(if dt > 0 { (db as f64 / dt as f64) as f32 } else { 0.0 });
+            (busy, all) = (busy + db, all + dt);
+        }
+        self.processors = processors;
+        s.system = if all > 0 { busy as f64 / all as f64 } else { 0.0 };
+        let process = process_time();
+        let wall = (now - self.process.1).as_secs_f64();
+        s.ours = if wall > 0.0 { process.saturating_sub(self.process.0) as f64 / 1e7 / wall } else { 0.0 };
+        self.process = (process, now);
+        let (working, private) = process_memory();
+        s.ram = (linux_resident().unwrap_or(private), working, physical_memory());
+        if let Some(host) = super::host() {
+            let [budget, used, _, _] = host.video_memory().unwrap_or_default();
+            s.vram = (used, budget);
+        }
+    }
+}
+
 /// What the painter is asked for: the numbers, the scale, the pixels'
 /// format (RGBA for the blending pass) and pitch, and what tells the picture
 /// for those apart.
@@ -529,6 +571,7 @@ impl Painter {
         let p = painter.clone();
         let started = std::thread::Builder::new().name("victory-panel".into()).spawn(move || {
             let mut fonts: Option<super::hud::Type> = None;
+            let mut numbers = SystemNumbers::new();
             loop {
                 let job = {
                     let mut job = p.job.lock().unwrap_or_else(|e| e.into_inner());
@@ -547,7 +590,9 @@ impl Painter {
                     }
                 }
                 let Some(t) = fonts.as_mut() else { return };
-                let picture = super::hud::paint(t, &job.snapshot);
+                let mut snapshot = job.snapshot;
+                numbers.fill(&mut snapshot);
+                let picture = super::hud::paint(t, &snapshot);
                 let bytes = if job.format == DXGI_FORMAT_R8G8B8A8_UNORM && blend_asked() {
                     Some(picture.rgba(job.pitch))
                 } else {
@@ -599,8 +644,7 @@ pub(super) struct Panel {
     snapshot: super::hud::Snapshot,
     times: std::collections::VecDeque<f32>,
     rates: std::collections::VecDeque<f32>,
-    processors: Vec<(u64, u64)>,
-    process: (u64, Instant),
+
     /// The fonts, once made; whether they could not be.
     /// The thread that paints the panel, once started.
     painter: Option<std::sync::Arc<Painter>>,
@@ -623,8 +667,7 @@ impl Panel {
             snapshot: super::hud::Snapshot::default(),
             times: std::collections::VecDeque::with_capacity(FRAMES_KEPT),
             rates: std::collections::VecDeque::with_capacity(RATES_KEPT),
-            processors: processor_times(),
-            process: (process_time(), now),
+
             painter: None,
         }
     }
@@ -755,27 +798,10 @@ impl Panel {
             self.rates.pop_front();
         }
         self.rates.push_back(fps as f32);
-        // Each processor, and the whole, since the last look.
-        let processors = processor_times();
-        let mut cores = Vec::with_capacity(processors.len());
-        let (mut busy, mut all) = (0u64, 0u64);
-        for (i, &(b, t)) in processors.iter().enumerate() {
-            let (b0, t0) = self.processors.get(i).copied().unwrap_or((b, t));
-            let (db, dt) = (b.saturating_sub(b0), t.saturating_sub(t0));
-            cores.push(if dt > 0 { (db as f64 / dt as f64) as f32 } else { 0.0 });
-            (busy, all) = (busy + db, all + dt);
-        }
-        self.processors = processors;
-        let process = process_time();
-        let wall = (now - self.process.1).as_secs_f64();
-        let ours = if wall > 0.0 { process.saturating_sub(self.process.0) as f64 / 1e7 / wall } else { 0.0 };
-        self.process = (process, now);
+        let _ = (host, now);
         let mut sorted: Vec<f32> = self.times.iter().copied().collect();
         sorted.sort_by(f32::total_cmp);
         let slow = sorted.get(sorted.len().saturating_sub(1).min(sorted.len() * 99 / 100)).map_or(0.0, |&v| f64::from(v));
-        let (working, private) = process_memory();
-        let held = linux_resident().unwrap_or(private);
-        let [budget, used, _, _] = host.video_memory().unwrap_or_default();
         let idle = (c[1] / 1e3).min(ms);
         super::hud::Snapshot {
             fps,
@@ -785,12 +811,14 @@ impl Panel {
             frames: self.times.iter().copied().collect(),
             rates: self.rates.iter().copied().collect(),
             shown_per: crate::streamline::shown_per_frame().max(1),
-            cores,
-            system: if all > 0 { busy as f64 / all as f64 } else { 0.0 },
-            ours,
+            // (The system's numbers: the painter's thread asks for them,
+            // [`SystemNumbers`].)
+            cores: Vec::new(),
+            system: 0.0,
+            ours: 0.0,
             gpu: if ms > 0.0 { ((ms - idle) / ms).clamp(0.0, 1.0) } else { 0.0 },
-            vram: (used, budget),
-            ram: (held, working, physical_memory()),
+            vram: (0, 0),
+            ram: (0, 0, 0),
             draws: c[10],
             dropped: c[8],
             submit: c[0] / 1e3,
