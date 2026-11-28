@@ -618,9 +618,17 @@ fn say() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    // Cells by how often their window over the pool was let go: at least
+    // 1, 2, 4, 8, 16 and 32 times ([`views_let_go`]).
+    let mut churn = [0u64; 6];
+    for &n in CHURN.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        for (at, least) in [1, 2, 4, 8, 16, 32].into_iter().enumerate() {
+            churn[at] += u64::from(n >= least);
+        }
+    }
     tracing::info!(
         "title memory in place: {} windows {} MB ({} of them {} MB over the page pool through views of our own, VICTORY_INPLACE_VIEWS; {} such refused by the host, \
-         {} kept and {} let go when the title mapped pages there again, {} marked changed where nothing had read, {} let go at a later ask, {} made copies instead in cells that churn, VICTORY_INPLACE_VIEWS_CHURN), \
+         {} kept and {} let go when the title mapped pages there again, {} marked changed where nothing had read, {} let go at a later ask, {} made copies instead in cells that churn, VICTORY_INPLACE_VIEWS_CHURN; cells let go at least 1, 2, 4, 8, 16, 32 times: {:?}), \
          {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
@@ -633,6 +641,7 @@ fn say() {
         s[13],
         s[14],
         s[15],
+        churn,
         s[2],
         s[3] >> 20,
         s[4],
