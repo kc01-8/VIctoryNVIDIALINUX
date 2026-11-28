@@ -776,6 +776,7 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+pub(crate) mod sampler_order;
 pub(crate) mod samplers;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
