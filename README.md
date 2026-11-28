@@ -47,8 +47,14 @@ Experimental with vkd3d-proton from master), branch `kc/foxhound`,
 | **Shaders** | ✅ **2,533 of the 2,534 shaders** the title asked for in a run translate (**99.96 %**); all **2,185** host pipelines made, **none failed** |
 | **What reaches the screen** | ⚠️ Of about 2,440 draws and dispatches a frame, **~69 % are drawn**; ~19 % are ray-tracing work left out on purpose; ~12 % wait for pipelines that are still compiling, or are the one program that does not translate |
 | **Frame rate** | ⚠️ **8–14 fps** at 1,400–3,700 draws a frame at best (run 41); 2–6 fps with the memory-saving settings (run 44). Goal: **60** |
-| **Memory** | ✅ 12–14 GB that cannot be reclaimed with title memory read in place (the goal: 12–14 GB, as on a console); 16–17 GB in the faster mode |
+| **Memory** | ✅ 12–14 GB that cannot be reclaimed with title memory read in place (the goal: 12–14 GB, as on a console; runs 49–51: 11.8–12.7 GB); 16–17 GB in the faster mode |
+| **Overlay** | ✅ A numbers panel (`VICTORY_PANEL=1` or F3): frame rate, frame-time and FPS graphs, every core, the card, VRAM and RAM, a frame's work, and a tape of the shaders and pipelines being made |
 | **Builds on Linux** | ✅ `victory.exe` cross-builds (gnullvm); unit tests run under Proton's Wine |
+
+Upstream: this fork's DXC fallback for Wine and its Linux notes are pull
+requests to trustno1's tree
+([#925](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/925),
+[#926](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/926)).
 
 Every number here comes from a recorded run; each run is in
 [docs/kc-linux-status.md](https://github.com/kc01-8/VIctoryNVIDIALINUX/blob/kc/foxhound/docs/kc-linux-status.md)
@@ -80,7 +86,8 @@ days** (2026-11-26 to 2026-11-27) and 44 recorded runs.
 | 11-27 | `kc/nvidia`, runs 25–32 | Title memory read in place instead of copied (`VICTORY_INPLACE`, `VICTORY_INPLACE_VIEWS`); the title's progress watchdog disarmed | Memory from the 18 GB cap to **12.2–13.1 GB**; a full **20-minute** run |
 | 11-27 | `kc/foxhound`, runs 33–36 | Moved to trustno1's tree, the Linux work carried over; every helper shader compiled at run time falls back to DXC | **1.6 → 5.6 fps** at 1,600–3,100 draws, 12.9 GB |
 | 11-27 | runs 37–43 | The sampling profiler found to crash the title; write faults without the guards' lock; the wineserver's requests traced; the root signatures Wine's compiler drops sent to DXC | **8.4–14 fps** at 1,400–3,700 draws; the depth planes, the scatter, the upload check, the tiles' look and keeping the card awake all working |
-| 11-28 | run 44 | 48 KiB of shared memory for thread groups; a CPU profile with `perf` | NVIDIA's shader compiler is 46 % of CPU samples three minutes in: compiled pipelines are not kept between runs ([next](#whats-next)) |
+| 11-28 | run 44 | 48 KiB of shared memory for thread groups; a CPU profile with `perf` | NVIDIA's shader compiler is 46 % of CPU samples three minutes in: compiled pipelines are not kept between runs |
+| 11-28 | runs 45–51 | NVIDIA's shader cache kept between runs; the title borderless at the screen's size; the numbers panel | a second run has half the pipelines left to compile at 90 s; the picture no longer resampled; 11.8–12.7 GB |
 
 ## What this fork adds for Linux
 
@@ -103,6 +110,9 @@ All of it is in `kc/foxhound`, each with its own commit and measurements.
 - **The title's progress watchdog disarmed** (`VICTORY_NO_WATCHDOG`, checked against the build's hash). Under Wine the title is slow enough for it to fire.
 - **The empty pipeline library.** A null-pointer fix in the pipeline library, so pipelines are made early on a second start.
 - **The BCPack tables supplied by the user.** They are no longer in the repository (`VICTORY_BCPACK_TABLES`, or beside `victory.exe`).
+- **NVIDIA's shader cache under umu.** The launcher gives the driver a cache folder of its own (`~/.cache/victory/nvidia`) and a size it takes (under 4 GiB), so compiled pipelines are kept between runs.
+- **The title borderless at the screen's size** (`VICTORY_FULLSCREEN=1` in the profile), so the picture is shown pixel for pixel.
+- **A numbers panel** (`VICTORY_PANEL=1`, F3): drawn on the CPU in the system's own fonts through GDI (no font ships with it), copied onto the picture. Under Wine its RAM is the process's own proportional anonymous and shared memory from Linux (`/proc/<pid>/smaps_rollup`; `Z:\proc\self` is the wineserver's).
 - **No downloads.** trustno1's launcher fetched DLSS, FSR, the Direct3D 12 runtime and a mod; here those commands say where to put the files and stop.
 
 ## Where it stands, in detail
@@ -141,15 +151,13 @@ The prefix's shader cache is empty: compiled pipelines are not reused from one r
 
 Ranked by what they should give. Each item names where to start.
 
-1. **Keep compiled pipelines between runs.** This is the largest single cost, and the main reason a tenth of the draws wait. Find out why the prefix's `shadercache` stays empty for a non-Steam title under umu:
-   - Proton's `__GL_SHADER_DISK_CACHE_PATH`;
-   - vkd3d-proton's `VKD3D_SHADER_CACHE_PATH`;
-   - victory's own pipeline library, only 565 KB (`crates/victory-gpu/src/pipeline/library.rs`).
-2. **The page pool without the wineserver or pinned copies.** Fewer, larger views; or keeping the views and remapping only what the title remaps (`crates/victory-gpu/src/inplace.rs`, `shadow.rs`).
-3. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point.
-4. **The meshlet program.** Run with `VICTORY_WAVE_WHY=1` to see what stops it now that 48 KiB fit (`crates/victory-shader/src/emit/lower.rs`).
-5. **Device method `0x218`**: precompiled native modules. [JMAN730's tree](https://github.com/JMAN730/victory) already parses their pieces.
-6. **Wine's `VirtualProtect`** costs about 0.44 ms a block for the write guards (`crates/victory-gpu/src/watch.rs`).
+1. **Bring over trustno1's, foxhound's and hyphennn's newer fixes** (about 70 commits on trustno1 alone; foxhound 0.2.0-pre.4's long-session fixes; hyphennn's static samplers in one order, so pipelines are not recompiled at every start). As cherry-picks: merging their history would bring back the BCPack tables.
+2. **Compiled pipelines.** NVIDIA's cache is now kept between runs; what is still compiled in play, and victory's own pipeline library (only 565 KB, `crates/victory-gpu/src/pipeline/library.rs`), are next.
+3. **The page pool without the wineserver or pinned copies.** Fewer, larger views; or keeping the views and remapping only what the title remaps (`crates/victory-gpu/src/inplace.rs`, `shadow.rs`).
+4. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point.
+5. **The meshlet program.** Run with `VICTORY_WAVE_WHY=1` to see what stops it now that 48 KiB fit (`crates/victory-shader/src/emit/lower.rs`).
+6. **Device method `0x218`**: precompiled native modules. [JMAN730's tree](https://github.com/JMAN730/victory) already parses their pieces.
+7. **Wine's `VirtualProtect`** costs about 0.44 ms a block for the write guards (`crates/victory-gpu/src/watch.rs`).
 
 ---
 
@@ -239,6 +247,7 @@ set -a; . profiles/linux-foxhound.env; set +a
 ./scripts/victory-proton.sh "/path/to/your/dump/title.exe" --execute   # run it
 ```
 
+- **The numbers panel:** `VICTORY_PANEL=1`, or F3 in play. `VICTORY_PANEL_BLEND=1` blends it with a translucent ground (off by default: two runs with it stopped early).
 - **Faster but heavier:** `VICTORY_INPLACE_VIEWS=0` (page-pool windows as
   copies: the best frame rate so far, 16–17 GB).
 - **Paths in `victory.toml`** are in Windows form; your files are on drive
