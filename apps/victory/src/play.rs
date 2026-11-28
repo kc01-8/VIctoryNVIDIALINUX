@@ -855,7 +855,7 @@ mod tests {
             #[command(flatten)]
             play: Play,
         }
-        let exe = Path::new(r"C:\Games\GTA VI's\game_scarlett_master.exe");
+        let exe = Path::new(r"C:\Games\A Title's\game_scarlett_master.exe");
         let first = [
             "x", "--series-s", "--dlss", "performance", "--framegen", "2", "--fg-type", "dlss", "--set", "VICTORY_MFG_UNLOCKER=1", "--set",
             "VICTORY_X=a b", "--preload",
@@ -864,7 +864,7 @@ mod tests {
         let args = restart_args(&o, exe);
         assert_eq!(
             args,
-            r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b'"
+            r"play 'C:\Games\A Title''s\game_scarlett_master.exe' --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b'"
         );
         // Read back as PowerShell reads it: the same options again, and no preload.
         let mut words: Vec<String> = Vec::new();
@@ -888,7 +888,7 @@ mod tests {
         let plain = Line::try_parse_from(["x"]).unwrap().play;
         assert_eq!(
             restart_args(&plain, exe),
-            r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
+            r"play 'C:\Games\A Title''s\game_scarlett_master.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
         );
     }
 

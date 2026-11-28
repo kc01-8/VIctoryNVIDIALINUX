@@ -134,7 +134,7 @@ tuned for **NVIDIA RTX** cards.
 
 This repository did not come from one place, and the base it stands on today
 is the end of a long comparison, not the start of the work. Over several weeks
-we built, ran and measured many projects on the same NVIDIA PC: Leonida,
+we built, ran and measured many projects on the same NVIDIA PC:
 [Marvisak's VIctory](https://github.com/Marvisak/VIctory),
 [fxceless's fork](https://github.com/fxceless/victory-fork),
 [the 7900 XTX fork](https://github.com/avatarmanz/VIctory-7900XTX),
