@@ -13,6 +13,13 @@ pressed once 18 s in. The runs before these, on hyphennn's tree, are in
 | 34 | windows of title memory in place, those over the page pool through views of our own (`VICTORY_INPLACE=1 VICTORY_INPLACE_VIEWS=1`) | the driver's memory 0.2 GB, at most 12.9 GB that could not be reclaimed; 1.4–2.2 frames a second; stopped by hand at 6.5 minutes |
 | 35 | the sampling profiler (`VICTORY_PROFILE`) | the title stopped itself at 2m29s, the profile not written; it lost, to Wine's compiler, the stand-in for the indirect light, the card compare, the depth planes' pass and keeping the card awake (below) |
 | 36 | every helper shader compiled at run time falls back to DXC; refused write-watch askings not asked again | 3–5.6 frames a second at 1,600–2,400 draws (179 ms a frame at best); no CPU snapshots for shader writes (187 ms a frame before); the title stopped itself at 1m30s, again with the profiler on |
+| 37 | no profiler | ran 9 minutes until stopped: the stops of runs 35–36 were the profiler's. 1.3–7 frames a second at 600–3,800 draws; the guards' lock: the title's threads waited 57 ms a frame for it in 154 write faults, ours 196 ms |
+| 38 | write faults open guarded blocks without the guards' lock (`VICTORY_FAULT_UNLOCKED=1`) | faults no longer wait (257 a frame opened without it); 1.3–15.5 frames a second; the wineserver at 81 % of a core, the whole process at 1.7–1.8 cores |
+| 39 | a trace of the wineserver's requests (`WINEDEBUG=+server`) | some 2,000 views mapped and as many unmapped a second, by the page-pool windows in views of our own |
+| 40 | (stopped while loading: the profile then overrode the environment; `kc-run.sh` now lets the environment win) | — |
+| 41 | page-pool windows as copies (`VICTORY_INPLACE_VIEWS=0`) | the wineserver at 30 %; **8.4–14 frames a second at 1,400–3,700 draws** at 5 minutes, the best yet; but 16.6 GB that could not be reclaimed, 4.4 GB of it the driver's pins of the copies |
+| 42 | Wine's compiler's lost root signatures go to DXC; cells let go twice get copies | the depth planes' pass and keeping the card awake work; 880 cells went to copies, and the run reached the 18 GB cap at 3–5 minutes |
+| 43 | (no data: the D3D12 device was not made, `E_OUTOFMEMORY`, right after run 42 was killed at the cap) | — |
 
 **Helper shaders.** This tree compiles more of its own shaders at run time
 than hyphennn's: the stand-in for the title's ray-traced light
@@ -21,10 +28,13 @@ upload check, the composer. Wine's builtin d3dcompiler_47 refuses most, and
 each failure quietly turns its feature off: without the card compare, run
 35 compared 3 GB of title buffers on the CPU every frame. All of them now go
 through `crate::hlsl::compile_for` (the system's compiler, then DXC at the
-6.0 model of the same stage). Still failing: the depth planes' pipeline
-(E_FAIL when it is made, not when compiled), and keeping the card awake
-(its own command queue: the driver refuses more channel groups, `GspRmAlloc
-failed … hClass=0xa06c` in the kernel log).
+6.0 model of the same stage). Wine's compiler also accepts
+`[RootSignature(...)]` and leaves it out of the code, and vkd3d-proton then
+fails `CreateRootSignature` with E_FAIL (no `RTS0` part): that, not the
+driver, was why the depth planes' pass and keeping the card awake failed,
+and the scatter, the upload check and the tiles' look were off without a
+word. Code without the root signature its source declares now goes to DXC
+too (run 42: all of them made).
 
 **Pipelines.** With the pipeline library, every pipeline is made early on a
 second start. What is still dropped: the title's ray-tracing passes, which
@@ -35,7 +45,24 @@ in `VICTORY_LEAVE_OUT`, and one compute program,
 it uses the host group's whole 32 KiB of shared memory, so no 32-lane form
 fits (`VICTORY_WAVE_WHY=1`: "LDS for the console waves' meetings past the
 host's 32 KiB is not supported"). Its 58–65 indirect dispatches a frame
-are dropped.
+are dropped. `VICTORY_HOST_LDS_KB=48` (in the Linux profile) lets the
+translator use Vulkan's 48 KiB on NVIDIA: translated code is not
+validated, and vkd3d-proton passes it on. Not yet seen in a run.
+
+Device method `0x218` (`DeserializeComputePipelineStateX`, named by
+JMAN730's tree) is not implemented in any tree: it makes compute pipelines
+from precompiled native modules for the title's own upscaler, and the
+title goes without them.
+
+**Page-pool windows: views or copies.** Under Wine every view mapped or
+unmapped is a request to the wineserver, one thread for the whole prefix.
+With the windows over the page pool in views of our own the title's
+remaps keep it busy (81 % of a core, run 38) and the title's threads wait
+behind it; as copies (run 41) the frame rate doubles but NVIDIA's Linux
+driver pins the copies, 4.4 GB more. Copies only for cells that churn
+(`VICTORY_INPLACE_VIEWS_CHURN`, off by default) did not pay: most cells
+churn. The card's memory is full in play (11.4–11.9 GB of 12), so the
+copies cannot move there (`VICTORY_WINDOWS_BAR_MB`) either.
 
 **Where a frame goes (run 36).** The card is about 29 % busy; the frame is
 the CPU's. The submitting thread works about 214 ms a frame: refreshes 72,
