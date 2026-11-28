@@ -825,7 +825,8 @@ fn process_time() -> u64 {
 ///
 /// Not `/proc/self`: under Wine that is the wineserver's (a file opened
 /// through drive Z: is looked up by it), so the panel showed its 16 MB.
-/// Our own process is the `victory.exe` in `/proc` with the most threads.
+/// Our own process is the one in `/proc` whose command line starts with our
+/// own path (Wine names it `main`, after its main thread).
 fn linux_resident() -> Option<u64> {
     use std::sync::atomic::AtomicU64;
     static HELD: AtomicU64 = AtomicU64::new(0);
@@ -868,18 +869,21 @@ fn linux_resident() -> Option<u64> {
     (held > 0).then_some(held)
 }
 
-/// Under Wine, the Linux process this is: of the processes named
-/// `victory.exe` in `/proc`, the one with the most threads; `None` without
-/// a `/proc` (Windows).
+/// Under Wine, the Linux process this is: of the processes in `/proc` whose
+/// command line starts with our own path (as Windows names it, `Z:\...`),
+/// the one with the most threads; `None` without a `/proc` (Windows).
 fn own_linux_process() -> Option<u32> {
+    let own = std::env::current_exe().ok()?.to_string_lossy().into_owned();
     let mut best: Option<(u32, u32)> = None;
     for entry in std::fs::read_dir(r"Z:\proc").ok()?.flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
-        let Ok(status) = std::fs::read_to_string(format!(r"Z:\proc\{pid}\status")) else { continue };
-        let field = |name: &str| status.lines().find(|l| l.starts_with(name)).map(|l| l[name.len()..].trim().to_owned());
-        if field("Name:").is_none_or(|n| !n.eq_ignore_ascii_case("victory.exe")) {
+        let Ok(command) = std::fs::read(format!(r"Z:\proc\{pid}\cmdline")) else { continue };
+        let first = command.split(|&b| b == 0).next().unwrap_or_default();
+        if !String::from_utf8_lossy(first).eq_ignore_ascii_case(&own) {
             continue;
         }
+        let Ok(status) = std::fs::read_to_string(format!(r"Z:\proc\{pid}\status")) else { continue };
+        let field = |name: &str| status.lines().find(|l| l.starts_with(name)).map(|l| l[name.len()..].trim().to_owned());
         let threads = field("Threads:").and_then(|t| t.parse::<u32>().ok()).unwrap_or(0);
         if best.is_none_or(|(_, most)| threads > most) {
             best = Some((pid, threads));
@@ -1011,13 +1015,13 @@ mod tests {
         }
     }
 
-    /// Under Wine our own Linux process is found (a test binary is no
-    /// `victory.exe`: none, and its memory is not read); on Windows there
-    /// is no `/proc`.
+    /// Under Wine our own Linux process is found, by its command line, and
+    /// its memory read; on Windows there is no `/proc`.
     #[test]
-    fn our_linux_process_is_looked_for() {
+    fn our_linux_process_is_found() {
         if std::fs::metadata(r"Z:\proc").is_ok() {
-            assert!(own_linux_process().is_none() || linux_resident().is_some());
+            assert!(own_linux_process().is_some());
+            assert!(linux_resident().is_some_and(|b| b > 1 << 20));
         } else {
             assert!(own_linux_process().is_none());
         }
