@@ -1221,8 +1221,27 @@ thread_local! {
     static PAIR_MEETINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// LDS dwords a host thread group has (D3D12: 32 KiB).
+/// LDS dwords a host thread group has (D3D12: 32 KiB), unless told more
+/// ([`set_host_lds_bytes`]).
 const HOST_LDS_DWORDS: u32 = 8192;
+
+/// See [`set_host_lds_bytes`].
+static HOST_LDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HOST_LDS_DWORDS);
+
+/// Tells the translator how many bytes of LDS a host thread group may use
+/// (less than D3D12's 32 KiB counts as 32 KiB). D3D12's validator holds
+/// shaders to 32 KiB, but translated code is not validated, and
+/// vkd3d-proton passes it on to Vulkan, whose limit on NVIDIA is 48 KiB
+/// (`maxComputeSharedMemorySize`): there the console waves' meetings fit
+/// past a program that uses all 32 KiB itself.
+pub fn set_host_lds_bytes(bytes: u32) {
+    HOST_LDS.store((bytes / 4).max(HOST_LDS_DWORDS), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// LDS dwords a host thread group may use ([`set_host_lds_bytes`]).
+fn host_lds_dwords() -> u32 {
+    HOST_LDS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Runs `f` with the two host waves of each console wave meeting on their own
 /// ([`Lower::meet`]) in console wave64 programs on 32-lane hosts whose thread group holds
@@ -1348,8 +1367,8 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), host_lds_dwords()]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2601,9 +2620,10 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        // A host group has 32 KiB of LDS (D3D12): the program's LDS with the meetings' and
-        // exchanges' dwords past it must fit (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
-        if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
+        // A host group has 32 KiB of LDS (D3D12), or what the host says ([`set_host_lds_bytes`]):
+        // the program's LDS with the meetings' and exchanges' dwords past it must fit
+        // (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
+        if self.pairs.is_some() && self.s.lds_dwords > host_lds_dwords() {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
         }
         if counted {

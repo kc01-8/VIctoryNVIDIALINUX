@@ -951,6 +951,12 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // LDS a thread group may use past D3D12's 32 KiB (`VICTORY_HOST_LDS_KB`): under
+        // vkd3d-proton, Vulkan's limit (48 KiB on NVIDIA). D3D12 itself tells no such limit.
+        if let Some(kb) = std::env::var("VICTORY_HOST_LDS_KB").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            victory_shader::emit::set_host_lds_bytes(kb.saturating_mul(1024));
+            tracing::info!(kb, "host thread groups' LDS (VICTORY_HOST_LDS_KB)");
+        }
         // Every translated shader is SM 6.6: below it each pipeline is refused (E_INVALIDARG),
         // and the title falls over within seconds (Windows 10's own D3D12, 2026-11-27).
         match crate::streamline::device_shader_model(&device) {
