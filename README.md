@@ -153,13 +153,14 @@ The prefix's shader cache is empty: compiled pipelines are not reused from one r
 
 Ranked by what they should give. Each item names where to start.
 
-1. **The title's threads' system calls.** With pipelines compiled ahead, a quarter of the CPU's samples are the kernel on the title's threads, mostly entering and leaving system calls (Wine's sync objects, `getrusage`), with the processor's speculation mitigations on every return. Which calls, and which can stay in user space.
-2. **The title's own frame loop.** In some stretches its main thread spins in a lookup of its pools' object handles until another thread adds one (`VICTORY_HANDLE_TABLE=1` reports the table); what that thread waits on.
-3. **The page pool without the wineserver or pinned copies.** Fewer, larger views; or keeping the views and remapping only what the title remaps (`crates/victory-gpu/src/inplace.rs`, `shadow.rs`).
-4. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point.
-5. **The meshlet program.** Run with `VICTORY_WAVE_WHY=1` to see what stops it now that 48 KiB fit (`crates/victory-shader/src/emit/lower.rs`).
-6. **Device method `0x218`**: precompiled native modules. [JMAN730's tree](https://github.com/JMAN730/victory) already parses their pieces.
-7. **Wine's `VirtualProtect`** costs about 0.44 ms a block for the write guards (`crates/victory-gpu/src/watch.rs`).
+1. **Write tracking without guards where Wine can keep a write watch.** The guards' write faults are the largest cost found: in the timeline of run 62 the title's threads spent half the recorded time in our fault handler, in `VirtualProtect` and `VirtualQuery`, waiting on Wine's one lock for its address space. Proton's Wine keeps write watches with userfaultfd and `PAGEMAP_SCAN` on Linux 6.7 and later: no faults, no protection changes. Title memory allocated with `MEM_WRITE_WATCH` (private memory, not views) can be watched so (`crates/victory-gpu/src/watch.rs`, `crates/victory-hle/src/modules/xmem.rs`).
+2. **The title's threads' system calls.** With pipelines compiled ahead, a quarter of the CPU's samples are the kernel on the title's threads, mostly entering and leaving system calls (Wine's sync objects, `getrusage`), with the processor's speculation mitigations on every return. Which calls, and which can stay in user space.
+3. **The title's own frame loop.** In some stretches its main thread spins in a lookup of its pools' object handles until another thread adds one (`VICTORY_HANDLE_TABLE=1` reports the table); what that thread waits on.
+4. **The page pool without the wineserver or pinned copies.** Fewer, larger views; or keeping the views and remapping only what the title remaps (`crates/victory-gpu/src/inplace.rs`, `shadow.rs`).
+5. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point.
+6. **The meshlet program.** Run with `VICTORY_WAVE_WHY=1` to see what stops it now that 48 KiB fit (`crates/victory-shader/src/emit/lower.rs`).
+7. **Device method `0x218`**: precompiled native modules. [JMAN730's tree](https://github.com/JMAN730/victory) already parses their pieces.
+8. **Wine's `VirtualProtect`** costs about 0.44 ms a block for the write guards (`crates/victory-gpu/src/watch.rs`).
 
 ---
 
