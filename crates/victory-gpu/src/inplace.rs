@@ -313,6 +313,7 @@ impl OwnViews {
                     std::ptr::null_mut(),
                     0,
                 );
+                OWN_VIEW_CALLS[0].fetch_add(1, Ordering::Relaxed);
                 if view.Value as usize != at {
                     own.undo(at);
                     return None;
@@ -394,12 +395,24 @@ impl OwnViews {
     fn unmap(&mut self) {
         // SAFETY: a pseudo handle.
         let process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        OWN_VIEW_CALLS[1].fetch_add(self.views.len() as u64, Ordering::Relaxed);
         for at in self.views.drain(..) {
             // SAFETY: a view of ours; unmapped without a placeholder, its
             // range is freed.
             unsafe { mem::UnmapViewOfFile2(process, mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, 0) };
         }
     }
+}
+
+/// Views of the page pool mapped and unmapped for windows in place, since
+/// the start. Under Wine each is a request of the wineserver's that walks
+/// the process's list of views ([`own_view_calls`]).
+static OWN_VIEW_CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Views of the page pool mapped and unmapped for windows in place since the
+/// start.
+pub(crate) fn own_view_calls() -> [u64; 2] {
+    OWN_VIEW_CALLS.each_ref().map(|n| n.load(Ordering::Relaxed))
 }
 
 /// The views [`OwnViews::map`] makes for `sources`: (first page, pages,

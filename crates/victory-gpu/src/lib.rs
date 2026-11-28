@@ -144,3 +144,10 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
     title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };
+
+/// Views of the page pool mapped and unmapped for windows in place since
+/// the start (`inplace`).
+#[cfg(windows)]
+pub fn own_view_calls() -> [u64; 2] {
+    inplace::own_view_calls()
+}

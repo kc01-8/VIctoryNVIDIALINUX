@@ -1107,8 +1107,18 @@ enum Call {
     Commit = 13,
 }
 
+/// Views of title memory the runtime mapped and unmapped since the start.
+static HOST_CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 /// Runs `f`, a system call, and counts it while the streaming log is on.
 fn counted<T>(call: Call, f: impl FnOnce() -> T) -> T {
+    // (Always: maps and unmaps, each a request of the wineserver's under
+    // Wine, which walks the process's list of views. `soft_line` says them.)
+    match call {
+        Call::Map => HOST_CALLS[0].fetch_add(1, Ordering::Relaxed),
+        Call::Unmap => HOST_CALLS[1].fetch_add(1, Ordering::Relaxed),
+        _ => 0,
+    };
     if !super::dstorage::stream_log::on() {
         return f();
     }
@@ -2309,11 +2319,32 @@ fn soft_views() -> u8 {
             use_soft_views();
             let said = std::thread::Builder::new().name("victory-soft-views".into()).spawn(|| {
                 let mut before = ([0; SOFT_FIELDS], [0; 2]);
+                let mut calls = [0u64; 4];
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(10));
                     if let Some(line) = soft_line(&mut before, 10) {
                         tracing::info!("{line}");
                     }
+                    let [ours_mapped, ours_unmapped] = victory_gpu::own_view_calls();
+                    let now = [
+                        HOST_CALLS[0].load(Ordering::Relaxed),
+                        HOST_CALLS[1].load(Ordering::Relaxed),
+                        ours_mapped,
+                        ours_unmapped,
+                    ];
+                    let d: Vec<u64> = now.iter().zip(calls).map(|(n, b)| n - b).collect();
+                    calls = now;
+                    tracing::info!(
+                        "views mapped and unmapped, last 10 s (under Wine each a request of the wineserver's, which walks the \
+                         process's list of views): the title's memory {} mapped, {} unmapped; windows in place over the page \
+                         pool {} mapped, {} unmapped; views now: the runtime's {}, the windows' {}",
+                        d[0],
+                        d[1],
+                        d[2],
+                        d[3],
+                        now[0] - now[1],
+                        now[2] - now[3]
+                    );
                 }
             });
             tracing::info!(
