@@ -309,6 +309,16 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         tally(10, 1);
         return None;
     }
+    // A view of the title's pages (the runtime's books say so, with no
+    // question to the system) is never write-watched: the system refuses it,
+    // and under Wine even the refusal waits on its one lock for the address
+    // space (216 of 219 askings a frame were refusals, run 62; the submitting
+    // thread's askings 633 ms in 2 seconds, run 66). Not asked.
+    if !matches!(crate::inplace::cover(first * PAGE, (last - first) * PAGE), crate::inplace::Cover::None) {
+        #[cfg(feature = "diagnostics")]
+        tally(10, 1);
+        return None;
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
