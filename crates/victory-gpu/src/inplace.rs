@@ -457,14 +457,25 @@ fn sources(at: usize, len: usize) -> Option<Vec<Source>> {
     if found.iter().all(Option::is_none) {
         return None;
     }
+    // A page in no view must not be committed memory; one answer of the
+    // system's covers a region of one state, so the pages after it in that
+    // region are not asked about again. (Asked page by page, up to 64 a
+    // window: 961 queries a second, 2.8 s of waits on Wine's one lock for
+    // the address space, run 68's timeline.)
+    let mut known_to = 0usize;
     for (k, _) in found.iter().enumerate().filter(|(_, s)| s.is_none()) {
+        let page = at + k * K64;
+        if page < known_to {
+            continue;
+        }
         // SAFETY: plain data filled in by the query.
         let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { mem::VirtualQuery((at + k * K64) as *const c_void, &mut info, size_of_val(&info)) };
+        let n = unsafe { mem::VirtualQuery(page as *const c_void, &mut info, size_of_val(&info)) };
         if n == 0 || info.State == mem::MEM_COMMIT {
             return None;
         }
+        known_to = (info.BaseAddress as usize).saturating_add(info.RegionSize);
     }
     Some(found)
 }
