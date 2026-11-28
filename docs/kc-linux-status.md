@@ -20,6 +20,7 @@ pressed once 18 s in. The runs before these, on hyphennn's tree, are in
 | 41 | page-pool windows as copies (`VICTORY_INPLACE_VIEWS=0`) | the wineserver at 30 %; **8.4–14 frames a second at 1,400–3,700 draws** at 5 minutes, the best yet; but 16.6 GB that could not be reclaimed, 4.4 GB of it the driver's pins of the copies |
 | 42 | Wine's compiler's lost root signatures go to DXC; cells let go twice get copies | the depth planes' pass and keeping the card awake work; 880 cells went to copies, and the run reached the 18 GB cap at 3–5 minutes |
 | 43 | (no data: the D3D12 device was not made, `E_OUTOFMEMORY`, right after run 42 was killed at the cap) | — |
+| 44 | `VICTORY_HOST_LDS_KB=48`; cells' churn counted; a CPU profile with `perf` | 2.2–5.5 frames a second at 1,800–2,700 draws, at most 14.0 GB that could not be reclaimed; 2,533 of 2,534 shaders translated, 2,185 pipelines made, none failed; the meshlet collect still has no 32-lane form; cells let go at least 1, 2, 4, 8, 16 times by 5 minutes: 646, 522, 380, 226, 37; NVIDIA's shader compiler 46 % of the CPU samples (17 % on the title's threads), with the prefix's shader cache empty |
 
 **Helper shaders.** This tree compiles more of its own shaders at run time
 than hyphennn's: the stand-in for the title's ray-traced light
