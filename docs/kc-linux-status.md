@@ -21,6 +21,13 @@ pressed once 18 s in. The runs before these, on hyphennn's tree, are in
 | 42 | Wine's compiler's lost root signatures go to DXC; cells let go twice get copies | the depth planes' pass and keeping the card awake work; 880 cells went to copies, and the run reached the 18 GB cap at 3–5 minutes |
 | 43 | (no data: the D3D12 device was not made, `E_OUTOFMEMORY`, right after run 42 was killed at the cap) | — |
 | 44 | `VICTORY_HOST_LDS_KB=48`; cells' churn counted; a CPU profile with `perf` | 2.2–5.5 frames a second at 1,800–2,700 draws, at most 14.0 GB that could not be reclaimed; 2,533 of 2,534 shaders translated, 2,185 pipelines made, none failed; the meshlet collect still has no 32-lane form; cells let go at least 1, 2, 4, 8, 16 times by 5 minutes: 646, 522, 380, 226, 37; NVIDIA's shader compiler 46 % of the CPU samples (17 % on the title's threads), with the prefix's shader cache empty |
+| 45 | NVIDIA's shader cache in a folder of its own, at a size under 4 GiB (`kc-run.sh`'s 16 GiB, 2^34, had left it unwritten) | the cache filled (153 MB); 13.9 GB at most; one 10-second stretch at 13.7 fps over 3,334 draws |
+| 46 | the same, a second time; the new numbers panel (copied) | the cache reused: 237 pipelines still being made at 90 s, against 508 at 2 minutes in run 45, none left a minute sooner; 15.6 GB at most |
+| 47 | the panel blended over the picture, with a tape of shaders and pipelines | the title stopped in its own crash handler at 1m32s |
+| 48 | the same | stopped again, at 1m48s |
+| 49 | the panel copied, opaque (`VICTORY_PANEL_BLEND=0`) | the full 6 minutes, 12.4 GB at most; one panel reading of 19.1 fps with the card 78 % busy: blending is off by default since |
+| 50 | the title's window borderless (`VICTORY_FULLSCREEN=1`): without it the window was fitted to the work area (2488x1400) and every frame resampled | the full 6 minutes, 12.7 GB at most; the panel's graphs sharp |
+| 51 | the panel's letters drawn three times wider and averaged across (lightly hinted) | the full 6 minutes, 11.8 GB at most; the panel's RAM read from the wineserver's books, not ours (fixed after) |
 
 **Helper shaders.** This tree compiles more of its own shaders at run time
 than hyphennn's: the stand-in for the title's ray-traced light
