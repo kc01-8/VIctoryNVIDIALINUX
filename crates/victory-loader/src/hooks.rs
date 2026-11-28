@@ -127,3 +127,121 @@ mod tests {
         assert!(BUILD_1_0_2_1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
+
+/// Environment variable that turns the handle table's report on.
+pub(crate) const HANDLE_TABLE_ENV: &str = "VICTORY_HANDLE_TABLE";
+
+/// The title's table of its pools' object handles (build 1.0.2.1): the
+/// count of its groups at `rva`, a pointer to the groups after it. A group
+/// is 16 control bytes (a slot's 7 hash bits; 0x80 and up: no key) and 16
+/// slots of 8 bytes, a slot's 32-bit key first. A key's home group is its
+/// hash (`murmur3`'s finish) shifted right by 7, under the count less one;
+/// a lookup walks group by group from there.
+///
+/// Under Proton a third to a half of the CPU's samples in play were that
+/// walk (kc/foxhound run 52, `perf`, the title's main threads): how full
+/// the table is and how far its keys are from home tell why.
+const HANDLE_TABLE_RVA: usize = 0x876fc48;
+
+fn murmur_finish(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// Of the groups' bytes `groups` (the count's worth): slots used, slots
+/// with no key, and the keys' distances from their home groups (mean,
+/// longest).
+fn handle_table_shape(groups: &[u8], count: usize) -> (usize, usize, f64, usize) {
+    let (mut used, mut free, mut sum, mut longest) = (0usize, 0usize, 0usize, 0usize);
+    for g in 0..count {
+        let group = &groups[g * 144..(g + 1) * 144];
+        for slot in 0..16 {
+            if group[slot] >= 0x80 {
+                free += 1;
+                continue;
+            }
+            used += 1;
+            let at = 16 + slot * 8;
+            let key = u32::from_le_bytes([group[at], group[at + 1], group[at + 2], group[at + 3]]);
+            let home = (murmur_finish(key) >> 7) as usize & (count - 1);
+            let distance = g.wrapping_sub(home) & (count - 1);
+            sum += distance;
+            longest = longest.max(distance);
+        }
+    }
+    (used, free, if used > 0 { sum as f64 / used as f64 } else { 0.0 }, longest)
+}
+
+/// Every ten seconds, how full the title's handle table is and how far its
+/// keys are from home (`VICTORY_HANDLE_TABLE=1`, build 1.0.2.1 only). Reads
+/// through `ReadProcessMemory`: a bad pointer is a failed read, not a fault.
+///
+/// # Safety
+/// `base` is the mapped image whose original BLAKE3 is `hash`.
+pub(crate) unsafe fn report_handle_table(base: usize, hash: &blake3::Hash) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
+        return;
+    }
+    let read = |at: usize, into: &mut [u8]| -> bool {
+        let mut got = 0;
+        // SAFETY: our own process; the system checks the range.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, into.as_mut_ptr().cast(), into.len(), &mut got) != 0 && got == into.len() }
+    };
+    let _ = std::thread::Builder::new().name("victory-handle-table".into()).spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let mut head = [0u8; 16];
+            if !read(base + HANDLE_TABLE_RVA, &mut head) {
+                continue;
+            }
+            let count = u32::from_le_bytes(head[0..4].try_into().unwrap()) as usize;
+            let groups_at = u64::from_le_bytes(head[8..16].try_into().unwrap()) as usize;
+            if count == 0 || !count.is_power_of_two() || count > 1 << 22 || groups_at == 0 {
+                tracing::info!(count, groups_at = format_args!("{groups_at:#x}"), "the title's handle table: not made yet");
+                continue;
+            }
+            let mut groups = vec![0u8; count * 144];
+            if !read(groups_at, &mut groups) {
+                continue;
+            }
+            let (used, free, mean, longest) = handle_table_shape(&groups, count);
+            tracing::info!(
+                slots = count * 16,
+                used,
+                full_percent = format_args!("{:.1}", 100.0 * used as f64 / (count * 16) as f64),
+                free,
+                mean_groups_from_home = format_args!("{mean:.1}"),
+                longest_groups_from_home = longest,
+                "the title's handle table ({HANDLE_TABLE_ENV})"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod handle_table_tests {
+    use super::*;
+
+    /// A key in its home group is 0 groups away; one put two groups on is
+    /// 2; empty slots count as free.
+    #[test]
+    fn keys_are_measured_from_home() {
+        let count = 8;
+        let mut groups = vec![0x80u8; count * 144];
+        let key = 0x1234_5678u32;
+        let home = (murmur_finish(key) >> 7) as usize & (count - 1);
+        let put = |groups: &mut Vec<u8>, g: usize, slot: usize, key: u32| {
+            groups[g * 144 + slot] = 0x11;
+            groups[g * 144 + 16 + slot * 8..g * 144 + 20 + slot * 8].copy_from_slice(&key.to_le_bytes());
+        };
+        put(&mut groups, home, 0, key);
+        put(&mut groups, (home + 2) % count, 3, key);
+        let (used, free, mean, longest) = handle_table_shape(&groups, count);
+        assert_eq!((used, free, longest), (2, count * 16 - 2, 2));
+        assert!((mean - 1.0).abs() < 1e-9);
+    }
+}

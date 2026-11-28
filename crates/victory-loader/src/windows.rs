@@ -89,6 +89,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
         tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
     }
+    if std::env::var_os(crate::hooks::HANDLE_TABLE_ENV).is_some() {
+        // SAFETY: just mapped; the report only reads, through the system.
+        unsafe { crate::hooks::report_handle_table(loaded.base(), &prepared.original_hash) };
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
