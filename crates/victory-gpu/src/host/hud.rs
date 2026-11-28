@@ -242,13 +242,13 @@ fn half(v: f32) -> u16 {
 /// Family names tried for labels, in order.
 /// (Proton's Wine sees its own fonts: its Arial and Microsoft Sans Serif
 /// stand-ins are sans.)
-/// (Of those Linux has, DejaVu Sans is the most strongly hinted: grey
-/// anti-aliased at panel sizes it is the sharpest, Noto Sans softer.)
+/// (Noto Sans first on Linux: the desktop's own, as sharp there when the
+/// picture is shown pixel for pixel; DejaVu Sans is more strongly hinted.)
 const SANS: &[&str] = &[
     "Segoe UI",
+    "Noto Sans",
     "DejaVu Sans",
     "Inter",
-    "Noto Sans",
     "Cantarell",
     "Ubuntu",
     "DejaVu Sans",
@@ -261,9 +261,9 @@ const SANS: &[&str] = &[
 const MONO: &[&str] = &[
     "Cascadia Mono",
     "Consolas",
+    "Noto Sans Mono",
     "DejaVu Sans Mono",
     "JetBrains Mono",
-    "Noto Sans Mono",
     "Ubuntu Mono",
     "Hack",
     "Liberation Mono",
@@ -556,13 +556,11 @@ impl Type {
     }
 }
 
-/// Grey anti-aliased coverage (0 to 255) as drawn: light letters blended on
-/// a dark ground in sRGB come out thinner and softer than they are, so the
-/// coverage is raised (a gamma, as stem darkening does) and its edge made a
-/// little steeper.
+/// Grey anti-aliased coverage (0 to 255) as drawn: as GDI gives it. (A
+/// steeper edge looked sharper only while the picture was resampled; shown
+/// pixel for pixel it made the letters crusty.)
 fn sharpened(cover: u32) -> f32 {
-    let a = cover as f32 / 255.0;
-    (a.powf(0.72) * 1.18 - 0.1).clamp(0.0, 1.0)
+    cover as f32 / 255.0
 }
 
 impl Drop for Type {
@@ -731,7 +729,8 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
     // loading screen's hundreds a second) is cut at the top. Its median,
     // which loading screens do not move.
     t.write(&mut c, left, y, "FPS · LAST MINUTE", Style::Head, palette::DIM, Align::Left);
-    let mut rates = s.rates.clone();
+    // (The median of play: past 240 a second it is a loading screen or a menu.)
+    let mut rates: Vec<f32> = s.rates.iter().copied().filter(|&r| r <= 240.0).collect();
     rates.sort_by(f32::total_cmp);
     let median = rates.get(rates.len() / 2).copied().unwrap_or(0.0);
     let top = 60.0;
@@ -861,8 +860,8 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
     t.write(&mut c, left, y, "VIctoryNVIDIALINUX", Style::Label, palette::ACCENT, Align::Left);
     let (kw, _) = t.measure("F3 hide", Style::Label);
     t.write(&mut c, (w as i32 - kw) / 2, y, "F3 hide", Style::Label, palette::DIM, Align::Left);
-    let cw = t.write(&mut c, right, y, "µs a frame", Style::Label, palette::DIM, Align::Right);
-    t.write(&mut c, right - cw - px(4.0), y - px(1.0), &format!("{:.0}", s.cost), Style::Value, palette::TEXT, Align::Right);
+    let cw = t.write(&mut c, right, y - px(1.0), &format!("{:.1} ms", s.cost / 1000.0), Style::Value, palette::TEXT, Align::Right);
+    t.write(&mut c, right - cw - px(5.0), y, "overlay", Style::Label, palette::DIM, Align::Right);
     c
 }
 

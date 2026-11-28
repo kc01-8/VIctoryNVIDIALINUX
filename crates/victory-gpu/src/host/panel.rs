@@ -403,10 +403,13 @@ unsafe impl Send for Blender {}
 unsafe impl Sync for Blender {}
 
 /// Whether the panel is blended over the picture with its translucent
-/// ground (`VICTORY_PANEL_BLEND=0`: copied over it, opaque).
+/// ground (`VICTORY_PANEL_BLEND=1`); else it is copied over it, opaque.
+/// Off by default: in both runs with it (kc/foxhound runs 47 and 48) the
+/// title stopped in its own crash handler 1.5-2 minutes in, and the run
+/// without it (49) went its full 6 minutes. Not known why yet.
 fn blend_asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PANEL_BLEND").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PANEL_BLEND").is_some_and(|v| v == "1"))
 }
 
 /// The blending pass, compiled once; `None` if it cannot be.
@@ -809,16 +812,51 @@ fn process_time() -> u64 {
 }
 
 /// Under Wine, the memory Linux holds for this process that cannot be
-/// given back without swap: resident anonymous and shared memory (the
-/// title's memory is in shared sections, which Windows' private bytes leave
-/// out). `None` on Windows. (NVIDIA's pins of buffers are not in it.)
+/// given back without swap: its anonymous and shared memory (the title's
+/// memory is in shared sections, which Windows' private bytes leave out),
+/// each page once. `None` on Windows. (NVIDIA's pins of buffers are not in
+/// it.)
+///
+/// Proportional sizes (`Pss_Anon`, `Pss_Shmem` of `/proc/self/smaps_rollup`)
+/// count a page mapped at two addresses once, as the title's pages are
+/// (their views and ours); `RssShmem` counts it twice (12.7 GB of shared
+/// memory against the cgroup's 6.7 GB). Walking every mapping takes time,
+/// so a thread of its own reads it every two seconds.
 fn linux_resident() -> Option<u64> {
-    let status = std::fs::read_to_string(r"Z:\proc\self\status").ok()?;
-    let field = |name: &str| -> Option<u64> {
-        let line = status.lines().find(|l| l.starts_with(name))?;
-        line[name.len()..].trim().trim_end_matches("kB").trim().parse::<u64>().ok().map(|kb| kb * 1024)
-    };
-    Some(field("RssAnon:")? + field("RssShmem:").unwrap_or(0))
+    use std::sync::atomic::AtomicU64;
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let read = || -> Result<u64, String> {
+            let text = std::fs::read_to_string(r"Z:\proc\self\smaps_rollup").map_err(|e| e.to_string())?;
+            let field = |name: &str| -> Option<u64> {
+                let line = text.lines().find(|l| l.starts_with(name))?;
+                line[name.len()..].trim().trim_end_matches("kB").trim().parse::<u64>().ok().map(|kb| kb * 1024)
+            };
+            match (field("Pss_Anon:"), field("Pss_Shmem:")) {
+                (Some(anon), shmem) => Ok(anon + shmem.unwrap_or(0)),
+                _ => Err(format!("no Pss_Anon in {} bytes", text.len())),
+            }
+        };
+        match read() {
+            Ok(bytes) => {
+                tracing::info!(mb = bytes >> 20, "the numbers panel's RAM: the process's anonymous and shared memory, from Linux");
+                HELD.store(bytes, Ordering::Relaxed);
+                let _ = std::thread::Builder::new().name("victory-panel-ram".into()).spawn(move || {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(2));
+                        match read() {
+                            Ok(bytes) => HELD.store(bytes, Ordering::Relaxed),
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            Err(e) => tracing::info!(error = %e, "the numbers panel's RAM: Windows' private bytes (no Linux books)"),
+        }
+    });
+    let held = HELD.load(Ordering::Relaxed);
+    (held > 0).then_some(held)
 }
 
 /// The PC's memory in bytes.
@@ -941,6 +979,15 @@ mod tests {
             assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), colours[1]);
             // Nothing past a line's end.
             assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
+        }
+    }
+
+    /// Under Wine the process's memory is read from Linux's own books, and
+    /// is more than nothing; on Windows there are none.
+    #[test]
+    fn resident_memory_is_read() {
+        if std::fs::metadata(r"Z:\proc\self\smaps_rollup").is_ok() {
+            assert!(linux_resident().is_some_and(|b| b > 1 << 20));
         }
     }
 
