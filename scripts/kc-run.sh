@@ -2,7 +2,10 @@
 # One reproducible run of a title under Proton: a switch profile, a run
 # folder outside the checkout with what was run and what the machine did.
 #
-#   scripts/kc-run.sh [options] TITLE.exe [-- victory run options]
+#   scripts/kc-run.sh [options] TITLE.exe [victory run options] [-- the title's arguments]
+#
+# What follows the title goes to `victory run` as it is: options of its own
+# (`--console series-s`) directly, the title's arguments after a `--`.
 #
 # --profile NAME  switches from profiles/NAME.env (default: default, which is empty)
 # --dry           map and bind only (no --execute)

@@ -46,8 +46,8 @@ Experimental with vkd3d-proton from master), branch `kc/foxhound`,
 | **Looks** | ✅ Most of the scene is drawn with its lighting and materials; by the maintainer's eye already ahead of the other public Linux attempts |
 | **Shaders** | ✅ **2,533 of the 2,534 shaders** the title asked for in a run translate (**99.96 %**); all **2,185** host pipelines made, **none failed** |
 | **What reaches the screen** | ⚠️ Of about 2,440 draws and dispatches a frame, **~69 % are drawn**; ~19 % are ray-tracing work left out on purpose; ~12 % wait for pipelines that are still compiling, or are the one program that does not translate |
-| **Frame rate** | ⚠️ **8–14 fps** at 1,400–3,700 draws a frame at best (run 41); 2–6 fps with the memory-saving settings (run 44). Goal: **60** |
-| **Memory** | ✅ 12–14 GB that cannot be reclaimed with title memory read in place (the goal: 12–14 GB, as on a console; runs 49–51: 11.8–12.7 GB); 16–17 GB in the faster mode |
+| **Frame rate** | ⚠️ **~5 fps** over the first four minutes in the profile's memory-saving settings (runs 74 and 77), **~10 fps** with copies in place of views at 15.4 GB (run 73); up to 15 in light scenes. The **wineserver** is what holds frames back (runs 70–78). Goal: **60** |
+| **Memory** | ✅ 11.9 GB at most that cannot be reclaimed, title memory read in place (the goal: 12–14 GB, as on a console; run 74); 15.4–16.0 GB in the faster modes (runs 73, 75) |
 | **Overlay** | ✅ A numbers panel (`VICTORY_PANEL=1` or F3): frame rate, frame-time and FPS graphs, every core, the card, VRAM and RAM, a frame's work, and a tape of the shaders and pipelines being made |
 | **Builds on Linux** | ✅ `victory.exe` cross-builds (gnullvm); unit tests run under Proton's Wine |
 
@@ -89,6 +89,8 @@ days** (2026-11-26 to 2026-11-27) and 44 recorded runs.
 | 11-28 | run 44 | 48 KiB of shared memory for thread groups; a CPU profile with `perf` | NVIDIA's shader compiler is 46 % of CPU samples three minutes in: compiled pipelines are not kept between runs |
 | 11-28 | runs 45–51 | NVIDIA's shader cache kept between runs; the title borderless at the screen's size; the numbers panel | a second run has half the pipelines left to compile at 90 s; the picture no longer resampled; 11.8–12.7 GB |
 | 11-28 | runs 52–56 | trustno1's 64 newer commits, foxhound 0.2.0-pre.4's settings and hyphennn's static-sampler order brought over; write faults under the guards' lock again | **every pipeline made by 90 seconds** on a second start (NVIDIA's compiler had been 41–46 % of the CPU in play); no more early stops (all five came of unlocked write faults); 12.1–12.3 GB |
+| 11-28 | runs 57–69 | A timeline of where each frame waits; the waits on our own locks and on Wine's address-space calls shortened one by one | The waits moved, the frame rate did not (4.4 fps over the same stretch) |
+| 11-28 | runs 70–78 | `perf` of the process and of the wineserver; maps and unmaps counted; the windows over the page pool limited to cells that do not churn | **Found what holds frames back**: the wineserver walks the process's ~90,000 views for every map and unmap, 90 % of a core, and the process waits behind it (1.2 of 16 cores busy). **2.65 → 4.94 fps** at 11.9 GB; 10.0 fps with no windows at 15.4 GB. Lower resolution changes nothing |
 
 ## What this fork adds for Linux
 
@@ -139,10 +141,12 @@ All of it is in `kc/foxhound`, each with its own commit and measurements.
 
 The prefix's shader cache is empty: compiled pipelines are not reused from one run to the next.
 
-**The page pool: views or copies.** Under Wine every view mapped or unmapped is a request to the wineserver, a single thread for the whole prefix.
-- **With views:** the title's remaps kept the wineserver at 81 % of a core, and the title's threads waited behind it.
-- **As copies:** the wineserver dropped to 30 % and the frame rate doubled, but the driver pins the copies (4.4 GB more).
-- **Neither cheaper option works.** Copying only the cells that churn did not help, because most cells churn. The card's memory is full in play (11.4–11.9 GB of 12), so the copies cannot move there either.
+**The wineserver holds frames back (runs 70–78).** Under Wine every view mapped or unmapped is a request to the wineserver, one thread for the whole prefix, and for each it walks the process's whole list of views (`is_valid_view_addr` 54 % and `req_unmap_view` 41 % of its samples). The process holds ~90,000 views, so at ~2,000 requests a second the server is 88–90 % busy. Wine keeps its address-space lock while a thread waits for it, so every `VirtualQuery`, `VirtualProtect` and `GetWriteWatch` in the process queues behind it: the process had 1.2 of 16 cores busy, the card 10–20 %.
+- **Who asks:** the windows over the page pool made three quarters of the requests, because a window is remade whole when the title remaps any page under it; the runtime's views of title memory are most of the list (~77,000).
+- **With views for every cell:** 2.65 fps over 60–240 s, 12.7 GB (run 72).
+- **As copies:** 10.04 fps, the wineserver at 29 %, but 15.4 GB (run 73).
+- **Copies for cells let go 4 times** (`VICTORY_INPLACE_VIEWS_CHURN=4`, the profile's now): 4.94 fps at 11.9 GB (run 74). With the title's mapping calls kept in the books as well (`VICTORY_SOFT_VIEWS=1`): 8.61 fps, 16.0 GB (run 75).
+- The card's memory is full in play (9.3–10.3 GB of its 10.3 GB budget), so the copies cannot move there.
 
 **Known problems.**
 - **NVIDIA's 620 drivers can freeze the desktop.** After `NVRM: intermapRegisterDmaMapping: Failed to insert new mapping node` (`journalctl -k`), the driver can loop holding its lock when a process exits ([open-gpu-kernel-modules#1540](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1540), fix in [#1542](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1542)). Other Proton games hit it too. Low memory and many buffers made and freed make it likelier.
@@ -151,16 +155,59 @@ The prefix's shader cache is empty: compiled pipelines are not reused from one r
 
 ## What's next
 
-Ranked by what they should give. Each item names where to start.
+Ranked by what they should give. Each item names where to start. Every
+step is judged by the wineserver's load (`perf stat -p $(pgrep -n wineserver)`),
+the log's 10-second "views mapped and unmapped" line and the frame rate over
+one stretch of the run (`fpsavg.py --skip 60 --until 240`: every run passes
+the same scenes at the same times), within 12–14 GB.
 
-1. **Write tracking without guards where Wine can keep a write watch.** The guards' write faults are the largest cost found: in the timeline of run 62 the title's threads spent half the recorded time in our fault handler, in `VirtualProtect` and `VirtualQuery`, waiting on Wine's one lock for its address space. Proton's Wine keeps write watches with userfaultfd and `PAGEMAP_SCAN` on Linux 6.7 and later: no faults, no protection changes. Title memory allocated with `MEM_WRITE_WATCH` (private memory, not views) can be watched so (`crates/victory-gpu/src/watch.rs`, `crates/victory-hle/src/modules/xmem.rs`).
-2. **The title's threads' system calls.** With pipelines compiled ahead, a quarter of the CPU's samples are the kernel on the title's threads, mostly entering and leaving system calls (Wine's sync objects, `getrusage`), with the processor's speculation mitigations on every return. Which calls, and which can stay in user space.
-3. **The title's own frame loop.** In some stretches its main thread spins in a lookup of its pools' object handles until another thread adds one (`VICTORY_HANDLE_TABLE=1` reports the table); what that thread waits on.
-4. **The page pool without the wineserver or pinned copies.** Fewer, larger views; or keeping the views and remapping only what the title remaps (`crates/victory-gpu/src/inplace.rs`, `shadow.rs`).
-5. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point.
-6. **The meshlet program.** Run with `VICTORY_WAVE_WHY=1` to see what stops it now that 48 KiB fit (`crates/victory-shader/src/emit/lower.rs`).
-7. **Device method `0x218`**: precompiled native modules. [JMAN730's tree](https://github.com/JMAN730/victory) already parses their pieces.
-8. **Wine's `VirtualProtect`** costs about 0.44 ms a block for the write guards (`crates/victory-gpu/src/watch.rs`).
+1. **Upstream work first (no runs needed to bring it over).** foxhound
+   0.2.0-pre.3 to pre.5 (squashed releases, ported by their content):
+   placed views that keep memory flat in long play (about 3 GB more every
+   20 minutes before), the texture sweep for long sessions, preludes from a
+   shared pool (about 190 alive instead of 1,100), card steps that read
+   adjacent places in one copy (6,300 to 1,781 copies a frame), textures
+   made in the PC's memory when the card is full, DLSS on the Series S
+   start. trustno1: the start's crash fixes, the long-session memory
+   switches, the DLSS fixes, mouse and keyboard controls, the clippy fixes,
+   the Linux build notes.
+2. **The title's mapping calls kept in the books without reading their
+   pages through copies.** `VICTORY_SOFT_VIEWS=1` took the wineserver from
+   68 % to 34 % and the frame rate from 4.94 to 8.61 fps, but 4 GB more
+   (run 75), because memory with such views is read through copies. The
+   books know each page's section and offset, so the windows in place can
+   map them from the section directly (`crates/victory-hle/src/modules/xmem.rs`
+   `soft_read`, `crates/victory-gpu/src/inplace.rs` `sources`).
+3. **Fewer requests for the windows over the page pool.** A window is
+   remade whole when the title remaps one page under it; cells let go 4
+   times get copies now. Next: smaller windows, or remade only when the card
+   next reads them.
+4. **The page pool through the card's page tables (a probe first).** The
+   console's card reads the same 64 KiB pages as its CPU, and D3D12's tiles
+   are 64 KiB too: a few large heaps over the pool, imported once, and
+   reserved buffers whose tiles follow the title's mappings
+   (`UpdateTileMappings`) would make no wineserver request per remap. First:
+   whether vkd3d-proton and the driver bind sparse buffers to imported host
+   memory.
+5. **DLSS and FSR 3 frame generation, with the user's own NVIDIA files.**
+   Streamline's `sl.dlss.dll` and NVIDIA's `nvngx_dlss.dll` (NVIDIA's
+   Streamline SDK; not in this repository) give DLSS upscaling on the
+   Series X start, and with it AMD's FSR 3 frame generation on RTX 30 cards
+   (DLSS frame generation does not run on them). It doubles the frames
+   shown, not the frames made, so it pays once those are near 30.
+6. **The Series S start**, still not measured (run 78 passed its switch to
+   the title).
+7. **The title's own frame loop.** Its main thread spins in a yield loop
+   (run 70) and, in some stretches, in a lookup of its pools' object handles
+   until another thread adds one (`VICTORY_HANDLE_TABLE=1`). Profile again
+   once the wineserver is not the limit.
+8. **Write tracking without guards where Wine can keep a write watch**
+   (`crates/victory-gpu/src/watch.rs`, `xmem.rs`): Proton keeps write watches
+   with userfaultfd and `PAGEMAP_SCAN`, no faults and no protection changes.
+9. **Ray tracing**, with `VICTORY_BVH_BUILDER=1` as the starting point; **the
+   meshlet program** (`VICTORY_WAVE_WHY=1`, `crates/victory-shader/src/emit/lower.rs`);
+   **device method `0x218`**, precompiled native modules
+   ([JMAN730's tree](https://github.com/JMAN730/victory) parses their pieces).
 
 ---
 

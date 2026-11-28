@@ -40,6 +40,45 @@ pressed once 18 s in. The runs before these, on hyphennn's tree, are in
 | 61 | the same with `--features diagnostics` | the title stopped 3 minutes in, as the timeline asked Wine's dbghelp for symbols (a read of -1 inside it): under Wine the timeline names no functions since |
 | 62 | the timeline at 3 and 4 minutes | **where frames wait**: of six frames, two on landing jobs (84 and 94 ms), one on a `victory-under` thread outside our spans (1.2 s), one on Wine's address-space calls (277 ms). Over the 2 seconds recorded, the title's threads spent 1.0 s in `VirtualQuery` and 0.6 s in `VirtualProtect`, all of it **inside our guards' write-fault handler**, waiting on Wine's one lock for its address space; the submitting thread 0.3 s in `GetWriteWatch` |
 | 63 | a release build, the kernel's call chains | `NtQueryVirtualMemory` 1 sample in 23,394: the queries wait, they do not work. Proton's `ntdll.so` keeps write watches with userfaultfd and `PAGEMAP_SCAN` (no faults, no protection changes) on this kernel |
+| 64 | `VICTORY_GUARD_HOT=1000` (hot blocks stay open) | re-guards and faults about 60 % fewer, the frame rate the same (4.49 fps over 120–330 s) |
+| 65 | windows of title memory made with no lock on their table (`LOOSE`) | 4.37 fps over 120–330 s; landing jobs left the frames' chains (timeline of 66) |
+| 66–68 | diagnostics builds with the timeline; who makes each long kernel call | the frames' chains: `VirtualQuery` 22 %, `GetWriteWatch` 19 %, the frame meter 9–23 % (the panel's system queries on the presenting thread). Fixed after: the panel asks on its painter's thread, views are not asked of the write watch, the memory-map walk is off under a timeline, a window asks one query per region of holes |
+| 69 | a release build with those fixes | 4.37 fps over 120–330 s, as 64 and 65: the waits moved, the frame rate did not. Every run passes the same scenes at the same times, and from 330 s on is always slow (about 1 fps), so runs are compared over one window from here on |
+| 70 | `perf stat` and `perf record` of the process | **1.2 of 16 cores busy**; 22,600 context switches a second; the title's main thread spins in a yield loop; the submitting thread has 4 % of the samples, so its "preparing" is waiting. The wineserver: 90 % of a core |
+| 71 | `perf record` of the wineserver | **`is_valid_view_addr` 54 %, `req_unmap_view` 41 %**: each map and unmap walks the process's whole list of views |
+| 72 | the runtime's and the windows' maps and unmaps counted (every 10 s) | the process holds ~77,000 of the runtime's views and ~11,000 of the windows'; the windows make three quarters of the requests (7,000 maps and 7,500 unmaps in 10 s), as a window is remade whole when the title remaps any page under it. **2.65 fps** over 60–240 s, 12.7 GB at most |
+| 73 | no windows (`VICTORY_INPLACE_VIEWS=0`: copies) | **10.04 fps** over 60–240 s, the wineserver at 29 %; 15.4 GB at most, over the 12–14 GB aim |
+| 74 | a page-pool cell let go 4 times gets copies (`VICTORY_INPLACE_VIEWS_CHURN=4`, now the profile's) | **4.94 fps**, the wineserver at 68 %, **11.9 GB** at most |
+| 75 | 74 with the title's mapping calls kept in the books alone too (`VICTORY_SOFT_VIEWS=1`) | **8.61 fps**, the wineserver at 34 %; 16.0 GB at most (such views are read through copies) |
+| 76 | the title's own FidelityFX upscaling at the performance scale (`VICTORY_FSR_PATH=1`, `VICTORY_DLSS_MODE=performance`) | the title stopped at the start: a division by zero in its code (0xc0000094), as `play.rs` notes for small scenes |
+| 77 | 1080p upscaled by the title to 1440p (`VICTORY_RENDER_1080P=1`) | 4.88 fps against 74's 4.94, 14.1 GB: the resolution changes nothing, as the card is not what holds frames back |
+| 78 | meant as the Series S start, but `--console series-s` went to the title's arguments (after kc-run's `--`) | not a Series S run; kc-run's usage line corrected |
+
+**The wineserver (runs 70–78).** What bounds the frame rate under Proton is
+the wineserver, one thread for the whole prefix. Every `MapViewOfFile3` and
+`UnmapViewOfFile2` is a request to it, and for each it walks the process's
+list of views from the start (`is_valid_view_addr` for a map,
+`find_mapped_view` for an unmap): with ~90,000 views and ~2,000 requests a
+second it is 88–90 % busy. Wine holds its address-space lock while a thread
+waits for the server, so every `VirtualQuery`, `VirtualProtect` and
+`GetWriteWatch` in the process queues behind it: that is why those calls took
+a median of 0.5–1.4 ms whatever their size, and why shortening our own waits
+on them (runs 64–69) moved the waits without changing the frame rate. Two
+things set its load: how many views the process holds (the runtime's ~77,000
+of title memory, a view per run of pages; the windows' ~11,000) and how many
+it maps and unmaps (the windows' remaps, then the title's). The 10-second
+"views mapped and unmapped" line of the log says both.
+
+**DLSS and FSR here.** trustno1's tree has DLSS upscaling and frame
+generation through NVIDIA Streamline, and AMD FSR 3 frame generation for
+cards without DLSS frame generation. Both kinds of frame generation take the
+inputs of DLSS's upscaling on the Series X start, so all of it needs
+Streamline's `sl.dlss.dll` plugin and NVIDIA's `nvngx_dlss.dll`, which are
+NVIDIA's files and are not in this repository (user-sourced, from NVIDIA's
+Streamline SDK). DLSS frame generation does not run on RTX 30 cards in any
+case; FSR 3 frame generation would. Without those files the title's own
+FidelityFX upscaling is all there is, and a lower scene size does not help
+while the CPU side holds frames back (run 77).
 
 **Helper shaders.** This tree compiles more of its own shaders at run time
 than hyphennn's: the stand-in for the title's ray-traced light
