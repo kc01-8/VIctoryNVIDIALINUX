@@ -709,7 +709,10 @@ impl Panel {
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
         let ms = elapsed.as_secs_f64() * 1e3 / frames;
-        self.lines = text(&c, ms, self.worst, cost, host);
+        // (The dot letters' lines, which ask the system for memory numbers
+        // on this thread: only when the painter has no fonts.)
+        let dots = self.painter.as_ref().is_none_or(|p| p.no_fonts.load(Ordering::Relaxed));
+        self.lines = if dots { text(&c, ms, self.worst, cost, host) } else { vec![String::new()] };
         self.snapshot = self.snapshot(&c, ms, cost, host, now);
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);

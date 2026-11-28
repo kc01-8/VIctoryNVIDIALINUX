@@ -10485,9 +10485,11 @@ impl Host {
             }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
-            showing.next("the frame meter");
+            showing.next("the frame meter: the panel");
             p.panel.frame(p.meter.line_due());
+            showing.next("the frame meter: the menu");
             p.menu.frame();
+            showing.next("the frame meter");
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
