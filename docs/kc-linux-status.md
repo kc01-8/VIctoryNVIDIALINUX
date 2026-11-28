@@ -28,6 +28,11 @@ pressed once 18 s in. The runs before these, on hyphennn's tree, are in
 | 49 | the panel copied, opaque (`VICTORY_PANEL_BLEND=0`) | the full 6 minutes, 12.4 GB at most; one panel reading of 19.1 fps with the card 78 % busy: blending is off by default since |
 | 50 | the title's window borderless (`VICTORY_FULLSCREEN=1`): without it the window was fitted to the work area (2488x1400) and every frame resampled | the full 6 minutes, 12.7 GB at most; the panel's graphs sharp |
 | 51 | the panel's letters drawn three times wider and averaged across (lightly hinted) | the full 6 minutes, 11.8 GB at most; the panel's RAM read from the wineserver's books, not ours (fixed after) |
+| 52 | trustno1's 64 newer commits brought over (cherry-picks: their history still has the BCPack tables) | 7 minutes, 15.0 GB at most; NVIDIA's compiler 41 % of the CPU's samples (the translator changed, so every pipeline anew); the title's main threads half the rest in one walk of its handle table |
+| 53 | `victory play`'s memory stack and texture passes in the profile; the handle table measured | the title stopped at 3 minutes: an unhandled write to read-only title memory, in the table's own code. The table: 15 % full, every key in its home group |
+| 54 | write faults under the guards' lock again (`VICTORY_FAULT_UNLOCKED` was in all five runs that ended so: 39, 42, 47, 48, 53); the panel blended again | the full 8 minutes, 12.3 GB at most; 5.6–11.9 fps at 6 minutes; NVIDIA's compiler still 44 % three minutes in, with the cache "warm" |
+| 55 | hyphennn's static samplers in one kept order (the driver's cache had answered for nothing: their places differed at every start) | the first start in that order compiled everything; the title waited on a pipeline compiled on its own thread for its last 5 minutes |
+| 56 | the same, a second start | **every pipeline made by 90 seconds**, 17 slow; no stall, 8 minutes, 12.1 GB at most; NVIDIA's compiler gone from the profile; 1.1–13.2 fps. What is left: the title's threads' system calls (a quarter of the samples in the kernel) and its own code |
 
 **Helper shaders.** This tree compiles more of its own shaders at run time
 than hyphennn's: the stand-in for the title's ray-traced light

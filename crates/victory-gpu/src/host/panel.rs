@@ -497,6 +497,91 @@ impl Blender {
     }
 }
 
+/// What the painter is asked for: the numbers, the scale, the pixels'
+/// format (RGBA for the blending pass) and pitch, and what tells the picture
+/// for those apart.
+struct Job {
+    snapshot: super::hud::Snapshot,
+    scale: f32,
+    format: DXGI_FORMAT,
+    pitch: usize,
+    key: (u32, i32, u32),
+}
+
+/// The thread that paints the panel: the presenting thread hands it the
+/// numbers four times a second and takes the last picture it finished.
+struct Painter {
+    job: std::sync::Mutex<Option<Job>>,
+    asked: std::sync::Condvar,
+    done: std::sync::Mutex<Option<((u32, i32, u32), Vec<u8>)>>,
+    /// No fonts could be had: the dot letters.
+    no_fonts: AtomicBool,
+}
+
+impl Painter {
+    fn start() -> std::sync::Arc<Painter> {
+        let painter = std::sync::Arc::new(Painter {
+            job: std::sync::Mutex::new(None),
+            asked: std::sync::Condvar::new(),
+            done: std::sync::Mutex::new(None),
+            no_fonts: AtomicBool::new(false),
+        });
+        let p = painter.clone();
+        let started = std::thread::Builder::new().name("victory-panel".into()).spawn(move || {
+            let mut fonts: Option<super::hud::Type> = None;
+            loop {
+                let job = {
+                    let mut job = p.job.lock().unwrap_or_else(|e| e.into_inner());
+                    while job.is_none() {
+                        job = p.asked.wait(job).unwrap_or_else(|e| e.into_inner());
+                    }
+                    job.take().expect("asked for")
+                };
+                if fonts.as_ref().is_none_or(|t| t.scale() != job.scale) {
+                    let (w, _) = super::hud::size(job.scale);
+                    fonts = super::hud::Type::new((w, (72.0 * job.scale).ceil() as u32), job.scale);
+                    if fonts.is_none() {
+                        tracing::info!("no fonts for the numbers panel: its dot letters instead");
+                        p.no_fonts.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                let Some(t) = fonts.as_mut() else { return };
+                let picture = super::hud::paint(t, &job.snapshot);
+                let bytes = if job.format == DXGI_FORMAT_R8G8B8A8_UNORM && blend_asked() {
+                    Some(picture.rgba(job.pitch))
+                } else {
+                    picture.encode(job.format, job.pitch)
+                };
+                save_now_and_then(&picture);
+                if let Some(bytes) = bytes {
+                    *p.done.lock().unwrap_or_else(|e| e.into_inner()) = Some((job.key, bytes));
+                }
+            }
+        });
+        if started.is_err() {
+            painter.no_fonts.store(true, Ordering::Relaxed);
+        }
+        painter
+    }
+
+    /// Asks for a picture of `job` (one asked for before and not begun is
+    /// dropped: only the newest counts).
+    fn ask(&self, job: Job) {
+        *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
+        self.asked.notify_one();
+    }
+
+    /// The last picture finished, if one for `key` came since the last take.
+    fn take(&self, key: (u32, i32, u32)) -> Option<Vec<u8>> {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        match done.take() {
+            Some((k, bytes)) if k == key => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
 /// The panel of a presenter.
 pub(super) struct Panel {
     since: Instant,
@@ -517,8 +602,8 @@ pub(super) struct Panel {
     processors: Vec<(u64, u64)>,
     process: (u64, Instant),
     /// The fonts, once made; whether they could not be.
-    fonts: Option<super::hud::Type>,
-    no_fonts: bool,
+    /// The thread that paints the panel, once started.
+    painter: Option<std::sync::Arc<Painter>>,
 }
 
 impl Panel {
@@ -540,8 +625,7 @@ impl Panel {
             rates: std::collections::VecDeque::with_capacity(RATES_KEPT),
             processors: processor_times(),
             process: (process_time(), now),
-            fonts: None,
-            no_fonts: false,
+            painter: None,
         }
     }
 
@@ -606,18 +690,11 @@ impl Panel {
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
-        // The panel in the system's fonts, made at the first draw; else the
-        // dot letters.
+        // The panel in the system's fonts, painted on a thread of its own
+        // (it took 7.3 ms a frame on this one, run 57); else the dot letters.
         let k = super::hud::scale(height);
-        if self.fonts.as_ref().is_none_or(|t| t.scale() != k) && !self.no_fonts {
-            let (w, _) = super::hud::size(k);
-            self.fonts = super::hud::Type::new((w, (72.0 * k).ceil() as u32), k);
-            self.no_fonts = self.fonts.is_none();
-            if self.no_fonts {
-                tracing::info!("no fonts for the numbers panel: its dot letters instead");
-            }
-        }
-        let fancy = self.fonts.is_some() && colours(format).is_some();
+        let painter = self.painter.get_or_insert_with(Painter::start).clone();
+        let fancy = !painter.no_fonts.load(Ordering::Relaxed) && colours(format).is_some();
         // Blended onto the picture where the pass can be made (its buffers
         // hold RGBA), else copied over it.
         let blended = fancy && blend_asked() && blender().is_some_and(|b| b.pipeline(host, format).is_some());
@@ -636,19 +713,16 @@ impl Panel {
             self.changed = true;
         }
         let Some(buffers) = &mut self.buffers else { return };
+        let key = (k.to_bits(), held.0, buffers.pitch);
         if std::mem::take(&mut self.changed) {
-            match &mut self.fonts {
-                Some(fonts) if fancy => {
-                    let picture = super::hud::paint(fonts, &self.snapshot);
-                    if blended {
-                        buffers.write_picture(&picture.rgba(buffers.pitch as usize));
-                    } else if let Some(bytes) = picture.encode(format, buffers.pitch as usize) {
-                        buffers.write_picture(&bytes);
-                    }
-                    save_now_and_then(&picture);
-                }
-                _ => buffers.write(&self.lines, PANEL),
+            if fancy {
+                painter.ask(Job { snapshot: self.snapshot.clone(), scale: k, format: held, pitch: buffers.pitch as usize, key });
+            } else {
+                buffers.write(&self.lines, PANEL);
             }
+        }
+        if fancy && let Some(picture) = painter.take(key) {
+            buffers.write_picture(&picture);
         }
         if blended && let Some(pipeline) = blender().and_then(|b| b.pipeline(host, format)) {
             buffers.blend(host, &list.list, back, (width, height), format, &pipeline);
