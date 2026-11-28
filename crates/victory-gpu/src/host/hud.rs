@@ -78,6 +78,7 @@ impl Canvas {
         self.pixels[(y * self.width + x) as usize].0
     }
 
+    #[cfg(test)]
     pub(super) fn alpha_at(&self, x: u32, y: u32) -> f32 {
         self.pixels[(y * self.width + x) as usize].1
     }
@@ -130,13 +131,6 @@ impl Canvas {
                 };
                 self.blend(x + i, y + j, colour, alpha * opacity);
             }
-        }
-    }
-
-    /// A dashed level line across `[x, x + w)`.
-    pub(super) fn dashes(&mut self, x: i32, y: i32, w: i32, colour: Rgb) {
-        for i in (0..w).filter(|i| i % 6 < 3) {
-            self.blend(x + i, y, colour, 0.9);
         }
     }
 
@@ -248,8 +242,11 @@ fn half(v: f32) -> u16 {
 /// Family names tried for labels, in order.
 /// (Proton's Wine sees its own fonts: its Arial and Microsoft Sans Serif
 /// stand-ins are sans.)
+/// (Of those Linux has, DejaVu Sans is the most strongly hinted: grey
+/// anti-aliased at panel sizes it is the sharpest, Noto Sans softer.)
 const SANS: &[&str] = &[
     "Segoe UI",
+    "DejaVu Sans",
     "Inter",
     "Noto Sans",
     "Cantarell",
@@ -264,10 +261,10 @@ const SANS: &[&str] = &[
 const MONO: &[&str] = &[
     "Cascadia Mono",
     "Consolas",
+    "DejaVu Sans Mono",
     "JetBrains Mono",
     "Noto Sans Mono",
     "Ubuntu Mono",
-    "DejaVu Sans Mono",
     "Hack",
     "Liberation Mono",
     "Lucida Console",
@@ -466,7 +463,21 @@ impl Type {
         font
     }
 
+    /// Labels in `face` from here on, if the system has it (fonts made
+    /// again); whether it does.
+    #[cfg(test)]
+    pub(super) fn set_sans(&mut self, face: &str) -> bool {
+        let picked = self.pick(&[face, "\u{1}"], false);
+        let found = String::from_utf16_lossy(&picked[..picked.len() - 1]) == face;
+        if found {
+            self.faces[0] = picked;
+            self.set_quality(self.quality);
+        }
+        found
+    }
+
     /// Letters smoothed as `quality` says from here on (fonts made again).
+    #[cfg(test)]
     pub(super) fn set_quality(&mut self, quality: FONT_QUALITY) {
         // SAFETY: the fonts this made.
         unsafe {
@@ -478,6 +489,7 @@ impl Type {
     }
 
     /// The faces it found, for labels and for numbers.
+    #[cfg(test)]
     pub(super) fn faces(&self) -> [String; 2] {
         self.faces.each_ref().map(|f| String::from_utf16_lossy(&f[..f.len().saturating_sub(1)]))
     }
@@ -642,21 +654,12 @@ fn gb(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// A chart's scale on its right edge (the chart at `x, y`, `w` by `h`): its
-/// top value at the top and half of it halfway, written along the edge on
-/// backings of their own, with a faint line across at the half.
-#[allow(clippy::too_many_arguments)]
-fn scale_marks(t: &mut Type, c: &mut Canvas, (x, y, w, h): (i32, i32, i32, i32), inset: i32, top: f32, unit: &str) {
-    let number = |v: f32| if v >= 10.0 || v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.1}") };
-    let half_y = y + inset + (h - 2 * inset) / 2;
-    c.rect(x + inset, half_y, w - 2 * inset, 1, palette::GRID, 0.6);
-    let right = x + w;
-    for (text, at, edge) in [(format!("{}{unit}", number(top)), y + inset, true), (number(top / 2.0), half_y, false)] {
-        let (tw, th) = t.measure(&text, Style::Tick);
-        let top_y = if edge { at } else { at - th / 2 };
-        c.round_rect_by(right - tw - 3 * inset, top_y, tw + 2 * inset, th, inset, palette::BACK, 0.85);
-        t.write(c, right - 2 * inset, top_y, &text, Style::Tick, palette::DIM, Align::Right);
-    }
+/// A chart's range, small, right of it at `right`: its top value level
+/// with its top, 0 level with its bottom.
+fn range_marks(t: &mut Type, c: &mut Canvas, right: i32, y: i32, h: i32, top: f32) {
+    let (_, th) = t.measure("0", Style::Tick);
+    t.write(c, right, y, &format!("{top:.0}"), Style::Tick, palette::DIM, Align::Right);
+    t.write(c, right, y + h - th, "0", Style::Tick, palette::DIM, Align::Right);
 }
 
 /// The panel for `s`.
@@ -698,8 +701,11 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
     }
     y += heights[0] + gap;
 
-    // Frame times, newest at the right, with the 60 and 30 a second levels.
-    t.write(&mut c, left, y, "FRAME TIME", Style::Head, palette::DIM, Align::Left);
+    // Frame times, newest at the right; the chart's range, small, outside its
+    // right edge (its top at the top, 0 at the bottom), its unit in the head.
+    let gutter = px(30.0);
+    let chart = inner - gutter;
+    t.write(&mut c, left, y, "FRAME TIME · MS", Style::Head, palette::DIM, Align::Left);
     let mut sorted = s.frames.clone();
     sorted.sort_by(f32::total_cmp);
     let p95 = sorted.get(sorted.len() * 95 / 100).copied().unwrap_or(0.0);
@@ -709,57 +715,31 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
     );
     t.write(&mut c, right, y, &format!("last {} frames", s.frames.len()), Style::Label, palette::DIM, Align::Right);
     let (gy, gh) = (y + px(18.0), heights[1] - px(18.0));
-    c.round_rect_by(left, gy, inner, gh, px(5.0), palette::CARD, CARDS);
+    c.round_rect_by(left, gy, chart, gh, px(5.0), palette::CARD, CARDS);
     let bar = px(3.0).max(2);
-    let fit = (inner / (bar + 1)).max(1) as usize;
+    let fit = (chart / (bar + 1)).max(1) as usize;
     let shown = &s.frames[s.frames.len().saturating_sub(fit)..];
     for (i, &ms) in shown.iter().enumerate() {
-        let x = right - (shown.len() - i) as i32 * (bar + 1);
+        let x = left + chart - (shown.len() - i) as i32 * (bar + 1);
         let bh = ((ms / top).clamp(0.0, 1.0) * (gh - px(4.0)) as f32).round().max(1.0) as i32;
         c.rect(x, gy + gh - px(2.0) - bh, bar, bh, frame_colour(f64::from(ms)), 1.0);
     }
-    // Levels for 60, 30, 10 and 1 frames a second, named at the left on a
-    // backing of their own (above 4 % of the scale, so that they do not
-    // crowd its floor).
-    // Levels for 30, 10, 60 and 1 frames a second, in that order of say:
-    // each named at the left on a backing of its own unless that would
-    // crowd a name already there (its line stays).
-    scale_marks(t, &mut c, (left, gy, inner, gh), px(2.0), top, " ms");
-    let mut named: Vec<i32> = Vec::new();
-    for (ms, label) in [(1000.0 / 30.0, "30"), (100.0, "10"), (1000.0 / 60.0, "60"), (1000.0, "1")] {
-        if ms < top && ms > top * 0.04 {
-            let ly = gy + gh - px(2.0) - ((ms / top) * (gh - px(4.0)) as f32).round() as i32;
-            c.dashes(left + px(4.0), ly, inner - px(8.0), palette::TEXT);
-            let (lw, lh) = t.measure(label, Style::Tick);
-            if named.iter().all(|&other| (other - ly).abs() >= lh) {
-                c.round_rect_by(left + px(4.0), ly - lh / 2, lw + px(8.0), lh, px(3.0), palette::BACK, 0.85);
-                t.write(&mut c, left + px(8.0), ly - lh / 2, label, Style::Tick, palette::TEXT, Align::Left);
-                named.push(ly);
-            }
-        }
-    }
+    range_marks(t, &mut c, right, gy, gh, top);
     y += heights[1] + gap;
 
-    // The frame rate over the last minute.
+    // The frame rate over the last minute, from 0 to 60, the goal: more (a
+    // loading screen's hundreds a second) is cut at the top. Its median,
+    // which loading screens do not move.
     t.write(&mut c, left, y, "FPS · LAST MINUTE", Style::Head, palette::DIM, Align::Left);
-    // Scaled to the 95th percentile, so that a loading screen's hundreds of
-    // frames a second do not flatten the rest; those are cut at the top.
-    let most = s.rates.iter().copied().fold(0.0f32, f32::max);
     let mut rates = s.rates.clone();
     rates.sort_by(f32::total_cmp);
-    let p95 = rates.get(rates.len() * 95 / 100).copied().unwrap_or(0.0);
-    let top = ceiling(p95.max(10.0) * 1.1, &[15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0, 480.0, 1000.0]);
-    t.write(&mut c, right, y, &format!("best {most:.1}"), Style::Label, palette::DIM, Align::Right);
+    let median = rates.get(rates.len() / 2).copied().unwrap_or(0.0);
+    let top = 60.0;
+    t.write(&mut c, right, y, &format!("median {median:.1}"), Style::Label, palette::DIM, Align::Right);
     let (gy, gh) = (y + px(18.0), heights[2] - px(18.0));
-    c.round_rect_by(left, gy, inner, gh, px(5.0), palette::CARD, CARDS);
-    for level in [30.0f32, 60.0] {
-        if level < top {
-            let ly = gy + gh - 1 - ((level / top) * (gh - 1) as f32).round() as i32;
-            c.dashes(left + px(4.0), ly, inner - px(8.0), palette::GRID);
-        }
-    }
-    c.area(left + px(2.0), gy + px(2.0), inner - px(4.0), gh - px(4.0), &s.rates, top, palette::ACCENT);
-    scale_marks(t, &mut c, (left, gy, inner, gh), px(2.0), top, "");
+    c.round_rect_by(left, gy, chart, gh, px(5.0), palette::CARD, CARDS);
+    c.area(left + px(2.0), gy + px(2.0), chart - px(4.0), gh - px(4.0), &s.rates, top, palette::ACCENT);
+    range_marks(t, &mut c, right, gy, gh, top);
     y += heights[2] + gap;
 
     // Every processor.
@@ -832,7 +812,6 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
         x -= t.write(&mut c, x, y_totals + px(1.0), label, Style::Label, palette::DIM, Align::Right) + px(4.0);
         x -= t.write(&mut c, x, y_totals, &value.to_string(), Style::Value, colour, Align::Right) + px(12.0);
     }
-    t.write(&mut c, right, y, "since the start", Style::Label, palette::DIM, Align::Right);
     let (tape_top, tape_bottom) = (y + px(40.0), y + heights[6]);
     c.round_rect_by(left, tape_top, inner, tape_bottom - tape_top, px(5.0), palette::CARD, CARDS);
     let mut line_bottom = tape_bottom - px(4.0);
@@ -974,6 +953,34 @@ mod tests {
             }
         }
         let _ = std::fs::write(std::path::Path::new(&folder).join("hud-text.ppm"), ppm);
+    }
+
+    /// The labels' line in each sans face there may be, grey anti-aliased,
+    /// to compare their hinting: saved as `hud-faces.ppm`.
+    #[test]
+    fn text_in_each_face() {
+        let Some(folder) = std::env::var_os("VICTORY_HUD_PICTURE") else { return };
+        let Some(mut t) = Type::new((420, 64), 1.33) else { return };
+        let faces = ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial", "Cantarell", "Microsoft Sans Serif"];
+        let mut c = Canvas::new(420, faces.len() as u32 * 24, palette::BACK, 1.0);
+        let mut row = 0;
+        for face in faces {
+            if !t.set_sans(face) {
+                continue;
+            }
+            let y = row * 24 + 3;
+            t.write(&mut c, 6, y, "pipelines building  1% low", Style::Label, palette::TEXT, Align::Left);
+            t.write(&mut c, 410, y, face, Style::Label, palette::DIM, Align::Right);
+            row += 1;
+        }
+        let mut ppm = format!("P6 {} {} 255\n", c.width, c.height).into_bytes();
+        for y in 0..c.height {
+            for x in 0..c.width {
+                let Rgb(r, g, b) = c.at(x, y);
+                ppm.extend([r, g, b]);
+            }
+        }
+        let _ = std::fs::write(std::path::Path::new(&folder).join("hud-faces.ppm"), ppm);
     }
 
     /// The whole panel paints at every scale it may be shown at, text and
