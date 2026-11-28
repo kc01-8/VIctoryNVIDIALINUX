@@ -61,7 +61,16 @@
   SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
   folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
   The file is checked against Microsoft's signature and the tested SHA-256.
-  Windows 11 keeps using its own runtime.
+  Windows 11 keeps using its own runtime. A `D3D12` folder that is already
+  there, for example from a repack or another guide (1.618, 1.620), is used
+  at the version of its `D3D12Core.dll`. Before v2026.11.27.6 that version
+  had to be 1.614, or Windows refused Direct3D 12 with `0x887E0003` (the
+  fix in .4 and .5 did not take effect).
+- C: drive full? Set `VICTORY_HOME` to another folder, once, in a command
+  prompt: `setx VICTORY_HOME D:\victory`. Then start victory.exe from a new
+  window. Settings, saves, caches, logs and the downloads all go there
+  instead of `%LOCALAPPDATA%\victory`. To keep what you have, move that
+  folder's contents there first.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.
@@ -125,7 +134,7 @@ tuned for **NVIDIA RTX** cards.
 
 This repository did not come from one place, and the base it stands on today
 is the end of a long comparison, not the start of the work. Over several weeks
-we built, ran and measured many projects on the same NVIDIA PC:
+we built, ran and measured many projects on the same NVIDIA PC: Leonida,
 [Marvisak's VIctory](https://github.com/Marvisak/VIctory),
 [fxceless's fork](https://github.com/fxceless/victory-fork),
 [the 7900 XTX fork](https://github.com/avatarmanz/VIctory-7900XTX),
@@ -185,8 +194,8 @@ speed, in the picture and in simply being able to play it:
 
 - **DLSS in place of the title's upscaler**, with its model and mode to choose.
 - **DLSS frame generation with up to six frames shown for each one rendered**,
-  switched and changed while playing, without a restart (foxhound's is 2x, set
-  at the start). By Streamline's own count it shows exactly 2, 4 and 6.
+  switched and changed while playing, without a restart, once it was on at the
+  start or made ready with `-FrameGenReady` (foxhound's is 2x, set at the start). By Streamline's own count it shows exactly 2, 4 and 6.
 - **Why frame generation showed nothing on a full 12 GB card**, found and
   fixed: the card's memory is now shared out so that it has room.
 - **The frame rate at the top left of the picture**: frames rendered a second
@@ -324,7 +333,7 @@ fork has always had; its options:
 | `-Fps 60` | a frame rate cap (30 is the title's own) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
-| `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
+| `-FrameGenReady` | frame generation made ready but off, so the F1 menu can switch it while playing (costs frame rate: ready, frames go through Streamline's swap chain; without it, a change in F1 takes effect at the next start) |
 | `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
@@ -334,6 +343,10 @@ delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
 
+If the menu works but loading a scene closes the game, see the
+[Windows memory troubleshooting guide](docs/windows-memory.md). It shows how
+to check memory on systems with 32 GB of RAM or GPUs with 8 GB of VRAM.
+
 ## How it works, and the findings
 
 - [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README
@@ -341,6 +354,8 @@ delete that file to go back to them. Full screen: start the game, then run
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/linux-proton.md](docs/linux-proton.md): building on Linux and first
+  runs under Proton (experimental).
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
   and the light estimate.
 - [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this
@@ -363,6 +378,10 @@ A tree of other people's work with a little on top; the history is kept.
   and the others foxhound's README names.
 - Everyone who sent pull requests to this fork before the move; that work is
   in the history, on the branch that was `main` until then.
+- Testing save sharing (F1 > EXPORT SAVE / IMPORT SAVE) with their own saves, in
+  [discussion #520](https://github.com/trustno1-coder/VIctory-NVIDIA/discussions/520):
+  [DueTonight](https://github.com/DueTonight) and
+  [mikan123pro](https://github.com/mikan123pro).
 - NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time
   from a folder you supply.
 - Much of this fork's code was written with
