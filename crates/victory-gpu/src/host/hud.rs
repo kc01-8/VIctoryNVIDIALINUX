@@ -301,9 +301,9 @@ impl Style {
         match self {
             Style::Huge => (40.0, FW_BOLD.0, true),
             Style::Large => (19.0, FW_SEMIBOLD.0, true),
-            Style::Value => (13.0, FW_SEMIBOLD.0, true),
+            Style::Value => (14.0, FW_SEMIBOLD.0, true),
             Style::Head => (11.0, FW_BOLD.0, false),
-            Style::Label => (12.0, FW_MEDIUM.0, false),
+            Style::Label => (13.0, FW_MEDIUM.0, false),
             Style::Tick => (10.0, FW_SEMIBOLD.0, false),
             Style::Tape(step) => (tape_size(step), FW_MEDIUM.0, false),
             Style::TapeMono(step) => (tape_size(step), FW_MEDIUM.0, true),
@@ -313,7 +313,7 @@ impl Style {
 
 /// A tape line's text height `step` lines above the newest, at a scale of 1.
 fn tape_size(step: u8) -> f32 {
-    13.0 * (1.0 - 0.09 * f32::from(step)).max(0.5)
+    14.0 * (1.0 - 0.09 * f32::from(step)).max(0.5)
 }
 
 /// How opaque a tape line `step` lines above the newest is.
@@ -337,6 +337,8 @@ pub(super) struct Type {
     scale: f32,
     faces: [Vec<u16>; 2],
     fonts: Vec<(Style, HFONT)>,
+    /// How GDI smooths the letters, and how their coverage is taken.
+    quality: FONT_QUALITY,
 }
 
 // SAFETY: used by the presenting thread alone, under the presenter's lock.
@@ -380,7 +382,16 @@ impl Type {
             SelectObject(dc, bitmap.into());
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, COLORREF(0x00ff_ffff));
-            let mut t = Type { dc, bitmap, bits: bits.cast(), size, scale, faces: [Vec::new(), Vec::new()], fonts: Vec::new() };
+            let mut t = Type {
+                dc,
+                bitmap,
+                bits: bits.cast(),
+                size,
+                scale,
+                faces: [Vec::new(), Vec::new()],
+                fonts: Vec::new(),
+                quality: ANTIALIASED_QUALITY,
+            };
             t.faces = [t.pick(SANS, false), t.pick(MONO, true)];
             tracing::info!(
                 sans = %String::from_utf16_lossy(&t.faces[0][..t.faces[0].len() - 1]),
@@ -446,13 +457,24 @@ impl Type {
                 DEFAULT_CHARSET,
                 OUT_DEFAULT_PRECIS,
                 CLIP_DEFAULT_PRECIS,
-                ANTIALIASED_QUALITY,
+                self.quality,
                 0,
                 PCWSTR(face.as_ptr()),
             )
         };
         self.fonts.push((style, font));
         font
+    }
+
+    /// Letters smoothed as `quality` says from here on (fonts made again).
+    pub(super) fn set_quality(&mut self, quality: FONT_QUALITY) {
+        // SAFETY: the fonts this made.
+        unsafe {
+            for (_, font) in self.fonts.drain(..) {
+                let _ = DeleteObject(font.into());
+            }
+        }
+        self.quality = quality;
     }
 
     /// The faces it found, for labels and for numbers.
@@ -510,7 +532,8 @@ impl Type {
             for row in 0..h {
                 for col in 0..w {
                     let p = bits[row as usize * stride + col as usize];
-                    let cover = ((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff);
+                    let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
+                    let cover = if self.quality == CLEARTYPE_QUALITY { (r + g + b) / 3 } else { r.max(g).max(b) };
                     if cover > 0 {
                         canvas.blend(left + col, y + row, colour, sharpened(cover) * opacity);
                     }
@@ -521,11 +544,13 @@ impl Type {
     }
 }
 
-/// Grey anti-aliased coverage (0 to 255) with its edges drawn in a little:
-/// small text on a dark panel reads sharper so, and its stems no thinner.
+/// Grey anti-aliased coverage (0 to 255) as drawn: light letters blended on
+/// a dark ground in sRGB come out thinner and softer than they are, so the
+/// coverage is raised (a gamma, as stem darkening does) and its edge made a
+/// little steeper.
 fn sharpened(cover: u32) -> f32 {
     let a = cover as f32 / 255.0;
-    (a * 1.25 - 0.08).clamp(0.0, 1.0)
+    (a.powf(0.72) * 1.18 - 0.1).clamp(0.0, 1.0)
 }
 
 impl Drop for Type {
@@ -598,7 +623,7 @@ pub(super) fn scale(height: u32) -> f32 {
 
 /// Sections' heights at a scale of 1: the head, the frame times, the frame
 /// rate, the processors, the meters, the work, the tape, the foot.
-const SECTIONS: [f32; 8] = [56.0, 108.0, 62.0, 66.0, 74.0, 76.0, 170.0, 18.0];
+const SECTIONS: [f32; 8] = [56.0, 108.0, 72.0, 66.0, 76.0, 86.0, 176.0, 18.0];
 const GAP: f32 = 10.0;
 
 /// The panel's size in pixels at `scale`.
@@ -615,6 +640,23 @@ fn ceiling(v: f32, steps: &[f32]) -> f32 {
 /// Bytes as GB.
 fn gb(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
+}
+
+/// A chart's scale on its right edge (the chart at `x, y`, `w` by `h`): its
+/// top value at the top and half of it halfway, written along the edge on
+/// backings of their own, with a faint line across at the half.
+#[allow(clippy::too_many_arguments)]
+fn scale_marks(t: &mut Type, c: &mut Canvas, (x, y, w, h): (i32, i32, i32, i32), inset: i32, top: f32, unit: &str) {
+    let number = |v: f32| if v >= 10.0 || v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.1}") };
+    let half_y = y + inset + (h - 2 * inset) / 2;
+    c.rect(x + inset, half_y, w - 2 * inset, 1, palette::GRID, 0.6);
+    let right = x + w;
+    for (text, at, edge) in [(format!("{}{unit}", number(top)), y + inset, true), (number(top / 2.0), half_y, false)] {
+        let (tw, th) = t.measure(&text, Style::Tick);
+        let top_y = if edge { at } else { at - th / 2 };
+        c.round_rect_by(right - tw - 3 * inset, top_y, tw + 2 * inset, th, inset, palette::BACK, 0.85);
+        t.write(c, right - 2 * inset, top_y, &text, Style::Tick, palette::DIM, Align::Right);
+    }
 }
 
 /// The panel for `s`.
@@ -665,7 +707,7 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
         p95.max(20.0) * 1.15,
         &[25.0, 40.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0],
     );
-    t.write(&mut c, right, y, &format!("{} frames   scale {:.0} ms", s.frames.len(), top), Style::Label, palette::DIM, Align::Right);
+    t.write(&mut c, right, y, &format!("last {} frames", s.frames.len()), Style::Label, palette::DIM, Align::Right);
     let (gy, gh) = (y + px(18.0), heights[1] - px(18.0));
     c.round_rect_by(left, gy, inner, gh, px(5.0), palette::CARD, CARDS);
     let bar = px(3.0).max(2);
@@ -682,6 +724,7 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
     // Levels for 30, 10, 60 and 1 frames a second, in that order of say:
     // each named at the left on a backing of its own unless that would
     // crowd a name already there (its line stays).
+    scale_marks(t, &mut c, (left, gy, inner, gh), px(2.0), top, " ms");
     let mut named: Vec<i32> = Vec::new();
     for (ms, label) in [(1000.0 / 30.0, "30"), (100.0, "10"), (1000.0 / 60.0, "60"), (1000.0, "1")] {
         if ms < top && ms > top * 0.04 {
@@ -706,7 +749,7 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
     rates.sort_by(f32::total_cmp);
     let p95 = rates.get(rates.len() * 95 / 100).copied().unwrap_or(0.0);
     let top = ceiling(p95.max(10.0) * 1.1, &[15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0, 480.0, 1000.0]);
-    t.write(&mut c, right, y, &format!("best {most:.1}   scale {top:.0}"), Style::Label, palette::DIM, Align::Right);
+    t.write(&mut c, right, y, &format!("best {most:.1}"), Style::Label, palette::DIM, Align::Right);
     let (gy, gh) = (y + px(18.0), heights[2] - px(18.0));
     c.round_rect_by(left, gy, inner, gh, px(5.0), palette::CARD, CARDS);
     for level in [30.0f32, 60.0] {
@@ -716,6 +759,7 @@ pub(super) fn paint(t: &mut Type, s: &Snapshot) -> Canvas {
         }
     }
     c.area(left + px(2.0), gy + px(2.0), inner - px(4.0), gh - px(4.0), &s.rates, top, palette::ACCENT);
+    scale_marks(t, &mut c, (left, gy, inner, gh), px(2.0), top, "");
     y += heights[2] + gap;
 
     // Every processor.
@@ -904,6 +948,32 @@ mod tests {
         c.area(0, 20, 100, 20, &[1.0, 5.0, 10.0, 20.0], 10.0, palette::ACCENT);
         assert_eq!(c.at(99, 20), palette::ACCENT);
         assert_eq!(c.at(50, 10), palette::BACK);
+    }
+
+    /// Text in each smoothing GDI offers, to compare: with
+    /// `VICTORY_HUD_PICTURE`, saved side by side as `hud-text.ppm`.
+    #[test]
+    fn text_in_each_smoothing() {
+        let Some(folder) = std::env::var_os("VICTORY_HUD_PICTURE") else { return };
+        let k = 1.33;
+        let Some(mut t) = Type::new((420, 64), k) else { return };
+        let mut c = Canvas::new(420, 3 * 44, palette::BACK, 1.0);
+        for (i, q) in [ANTIALIASED_QUALITY, CLEARTYPE_QUALITY, NONANTIALIASED_QUALITY].into_iter().enumerate() {
+            t.set_quality(q);
+            let y = i as i32 * 44 + 4;
+            t.write(&mut c, 6, y, "1% low", Style::Label, palette::DIM, Align::Left);
+            t.write(&mut c, 70, y - 1, "5.3", Style::Value, palette::TEXT, Align::Left);
+            t.write(&mut c, 120, y, "FRAME TIME  pipelines building", Style::Label, palette::TEXT, Align::Left);
+            t.write(&mut c, 6, y + 20, "first drawn  mesh 6c3abd40 + pixel 77b790d0", Style::TapeMono(0), palette::TEXT, Align::Left);
+        }
+        let mut ppm = format!("P6 {} {} 255\n", c.width, c.height).into_bytes();
+        for y in 0..c.height {
+            for x in 0..c.width {
+                let Rgb(r, g, b) = c.at(x, y);
+                ppm.extend([r, g, b]);
+            }
+        }
+        let _ = std::fs::write(std::path::Path::new(&folder).join("hud-text.ppm"), ppm);
     }
 
     /// The whole panel paints at every scale it may be shown at, text and

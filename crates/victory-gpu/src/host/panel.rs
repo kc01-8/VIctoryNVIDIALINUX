@@ -402,6 +402,13 @@ unsafe impl Send for Blender {}
 // SAFETY: as above.
 unsafe impl Sync for Blender {}
 
+/// Whether the panel is blended over the picture with its translucent
+/// ground (`VICTORY_PANEL_BLEND=0`: copied over it, opaque).
+fn blend_asked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PANEL_BLEND").is_none_or(|v| v != "0"))
+}
+
 /// The blending pass, compiled once; `None` if it cannot be.
 fn blender() -> Option<&'static Blender> {
     static BLENDER: OnceLock<Option<Blender>> = OnceLock::new();
@@ -611,7 +618,7 @@ impl Panel {
         let fancy = self.fonts.is_some() && colours(format).is_some();
         // Blended onto the picture where the pass can be made (its buffers
         // hold RGBA), else copied over it.
-        let blended = fancy && blender().is_some_and(|b| b.pipeline(host, format).is_some());
+        let blended = fancy && blend_asked() && blender().is_some_and(|b| b.pipeline(host, format).is_some());
         let held = if blended { DXGI_FORMAT_R8G8B8A8_UNORM } else { format };
         let (size, scale) = if fancy {
             (super::hud::size(k), (k * 1000.0).round() as u32 * 2 + u32::from(blended))
