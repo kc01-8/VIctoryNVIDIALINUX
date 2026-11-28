@@ -819,8 +819,9 @@ fn process_time() -> u64 {
 /// Proportional sizes (`Pss_Anon`, `Pss_Shmem` of `smaps_rollup`) count a
 /// page mapped at two addresses once, as the title's pages are (their views
 /// and ours); `RssShmem` counts it twice (12.7 GB of shared memory against
-/// the cgroup's 6.7 GB). Walking every mapping takes time, so a thread of
-/// its own reads it every two seconds.
+/// the cgroup's 6.7 GB). Walking every mapping takes time (4.5 % of the
+/// CPU's samples read every two seconds, run 56: the title has a great many
+/// mappings), so a thread of its own reads it every fifteen seconds.
 ///
 /// Not `/proc/self`: under Wine that is the wineserver's (a file opened
 /// through drive Z: is looked up by it), so the panel showed its 16 MB.
@@ -853,7 +854,7 @@ fn linux_resident() -> Option<u64> {
                 HELD.store(bytes, Ordering::Relaxed);
                 let _ = std::thread::Builder::new().name("victory-panel-ram".into()).spawn(move || {
                     loop {
-                        std::thread::sleep(Duration::from_secs(2));
+                        std::thread::sleep(Duration::from_secs(15));
                         match read() {
                             Ok(bytes) => HELD.store(bytes, Ordering::Relaxed),
                             Err(_) => break,
